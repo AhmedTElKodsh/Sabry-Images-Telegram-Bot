@@ -1,0 +1,31 @@
+# Local Apps Script project binding
+.clasp.json
+
+# Local agent and BMAD installations (project artifacts remain in _bmad-output/)
+_bmad/
+.agent/
+.agents/
+.claude/
+.github/agents/
+.kiro/
+.trae/
+skills-lock.json
+_bmad-output/**/.memlog.md
+_bmad-output/party-mode/memories/
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+client_secret*.json
+credentials*.json
+token*.json
+
+# Generated caches and editor/OS files
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
