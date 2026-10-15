@@ -240,6 +240,11 @@ publication, normal search delivery, or Drive fallback. A failed capture is
 tracked with `archive_attempts` and `archive_next_attempt_utc`. Transient
 failures use bounded `ARCHIVE_RETRY`; unsupported/corrupt bytes, ambiguous
 duplicate Drive objects, or exhausted retries use `ARCHIVE_FAILED_TERMINAL`.
+A Telegram redelivery retries capture only after `archive_next_attempt_utc` is
+due. Earlier deliveries and missing/invalid retry deadlines do not consume an
+attempt or complete the photo event. This relies on Telegram redelivery; there
+is no independent archive retry worker. A record left after Telegram stops
+retrying requires operator review before any replay.
 A redelivered update can reconcile the same deterministic Drive object and
 record without creating a duplicate.
 
@@ -361,5 +366,6 @@ performs the non-destructive configuration checklist above.
 
 ```powershell
 node tests/self_check.js
+node tests/archive_retry_check.js
 Get-Content -Raw -LiteralPath 'apps-script\Code.gs' | node --check -
 ```

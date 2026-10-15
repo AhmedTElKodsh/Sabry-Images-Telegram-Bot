@@ -281,6 +281,14 @@ function processPhoto_(update, message, records, events, config) {
       }
       return 'duplicate-record';
     }
+    if (existingStatus === 'ARCHIVE_RETRY') {
+      const deadline = existingValues[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC];
+      const retryAt = typeof deadline === 'string' ? Date.parse(deadline) : NaN;
+      if (!Number.isFinite(retryAt) || new Date(retryAt).toISOString() !== deadline ||
+          retryAt > Date.now()) {
+        throw new Error('Canonical archive retry is not due or its deadline is invalid.');
+      }
+    }
   }
 
   const userId = getUserId_(message);
