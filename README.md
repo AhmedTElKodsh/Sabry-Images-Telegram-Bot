@@ -1,405 +1,246 @@
-# School Images Telegram POC
+# School Images Telegram Bot
 
-Telegram photo messages are copied to a private Google Drive folder and indexed
-in the provided Google Sheet. A text message is associated only when it is
-immediately before or after the photo and was sent by the same user.
+Several school input groups feed one private image catalog. Drive stores the
+original image bytes, Sheets stores provenance, captions, analysis and workflow
+state, and **Elardh_Images_Group** receives the published copies. Teachers can
+search the same published catalog privately through **@SchoolImages_bot** or
+with `/search` in the output group.
 
-## Security first
+## Credentials and deployment
 
-The token previously pasted into chat must be revoked in BotFather. Never put
-the replacement token in this repository or in the spreadsheet.
+Keep `BOT_TOKEN`, `GROQ_API_KEY`, `WEBHOOK_SECRET` and any optional Gemini key in
+Apps Script Properties. Never put their values in source, Sheets, chat, logs or
+screenshots. The complete webhook URL contains a secret; do not copy it into a
+report. Avoid recording the Project Settings page while credentials are visible.
 
-## Configure and deploy
+The existing configuration uses `SPREADSHEET_ID`, `DRIVE_FOLDER_ID`,
+`ALLOWED_CHAT_ID` as the original input migration seed, and one fixed
+`OUTPUT_CHAT_ID`. The bot needs administrator status in the output group for
+reliable current-member checks. Keep the archive and catalog private; teachers
+receive results through Telegram rather than direct Drive sharing.
 
-Repository state is not proof of what is currently deployed in Apps Script.
-After deploying, copy **Manage deployments → Web app URL** into `WEB_APP_URL`.
-It must be the canonical `https://script.google.com/macros/s/<deployment-id>/exec`
-address, without a query or fragment. `bootstrapPoc()` validates this explicit
-address before setup and preserves it; editor execution may report a `/dev`
-service URL, which must never replace the versioned deployment address.
-Before setup, add these required values under **Project Settings → Script
-Properties**:
+The legacy `setupPoc()` validator also requires `SEARCH_USER_IDS` containing at
+least one numeric account ID; retain the operator's existing value during this
+upgrade. This is a setup-compatibility value, not the shared catalog's teacher
+access list. Do not add each teacher there: current output-group membership
+authorizes teacher search.
 
-- `BOT_TOKEN`: the rotated BotFather token.
-- `SPREADSHEET_ID`: the operator-owned catalog Sheet ID.
-- `DRIVE_FOLDER_ID`: the private operator-owned archive folder ID.
-- `ALLOWED_CHAT_ID`: the canonical negative numeric input-group ID.
-- `SEARCH_USER_IDS`: one or more comma-separated numeric Telegram user IDs.
+`WEB_APP_URL` must be the versioned canonical Apps Script `/exec` address,
+without query parameters or a fragment. Keep the existing deployment identity.
+The authenticated webhook uses one high-entropy query parameter because this
+Apps Script deployment cannot inspect Telegram's secret-token header. A proxy
+that validates that header is a possible later production improvement.
 
-`setupPoc()` validates every required value before changing properties or
-Sheets. It never supplies reusable project IDs and never binds itself to the
-first group it sees. It generates `WEBHOOK_SECRET` only when the operator-owned
-configuration is valid. Invite hashes are not chat IDs.
+Deploy reviewed source to a new immutable version of the existing deployment,
+using the maintenance order below. Compare saved editor source with the reviewed
+local source before activation.
+Do not treat passing local tests as proof of the deployed version, permissions,
+provider behavior or retrieval quality.
 
-Make the bot an administrator or creator in the configured input group. Private
-search requires both the static `SEARCH_USER_IDS` allowlist and a fresh
-`getChatMember` result proving that the user is still a current member; lookup
-errors fail closed.
+For the existing verified two-group installation:
 
-For an authorized release, use this order:
+1. Before replacing editor source, run `disableGroqTagging()` and
+   `disableOutputPublishing()` and wait for in-flight claims to settle. Pause the
+   webhook with `deleteWebhook` and `drop_pending_updates: false`. Use a temporary
+   editor wrapper calling `telegram_('deleteWebhook',
+   {drop_pending_updates: false}, getConfig_(false).botToken)`; log only its `ok`
+   flag. Keep secrets in Properties. Do not reset unknown deliveries, terminal
+   records or activation cutoffs. Saving editor source immediately affects
+   scheduled workers, even before updating the immutable web deployment.
+2. Save the reviewed source, then run `migrateSharedCatalog()` while delivery is
+   paused. It validates the previous token-bound group
+   verification and live bot identities, appends the schema, seeds the existing
+   input, and creates the output-only verification. Repeating migration must
+   preserve records and output message IDs. Stop on schema conflicts.
+3. Remove temporary wrappers and verify clean source parity, then create a new
+   immutable version on the existing deployment. Run
+   `installSharedCatalogWorkers()`, `enableGroqTaggingForNewPhotosOnly()` and
+   `enableOutputPublishing()` to restore all five managed workers. The existing
+   valid analysis cutoff is retained. These are five-minute schedules, not
+   immediate deadlines.
+4. Run `installWebhook()` to subscribe to `message`, `edited_message` and
+   `my_chat_member`, preserving queued Telegram updates.
+5. Inspect `catalogHealth()` and the execution page. `webhookInfo()` returns a
+   redacted URL; never print or inspect the unredacted webhook URL.
+6. Test only the approved synthetic fixture through intake, Drive, Groq,
+   publication, search and caption editing. Record local and live evidence
+   separately, including any untested multi-group cases.
 
-1. Push only the tracked Apps Script files, create a new immutable version, and
-   update the existing deployment ID. Confirm the deployment listing maps that
-   ID to the new version. Pull the deployed source into a separate temporary
-   directory and compare SHA-256 hashes for `Code.gs` and `appsscript.json`
-   against the reviewed local files before changing the webhook.
-2. Only after deployment identity and source parity are proven, run
-   `installWebhook()`. It rechecks the configured input group
-   and bot administrator status, then installs the exact
-   `WEB_APP_URL?telegram_webhook_key=<WEBHOOK_SECRET>` URL. The generated
-   high-entropy value remains in Script Properties and is accepted only from
-   that single parameter. Apps Script's public `/exec` endpoint is anonymous in
-   this deployment, while anonymous `/exec/<path>` requests are redirected to
-   Google sign-in; the query credential is therefore the constrained direct
-   Apps Script compatibility boundary. A proxy that validates Telegram's
-   `X-Telegram-Bot-Api-Secret-Token` header is the stronger production option.
-3. Run `webhookInfo()` and verify that the returned URL contains
-   `telegram_webhook_key=[REDACTED]`,
-   `pending_update_count` trends to zero as Telegram retries queued updates, and
-   the previous `401 Unauthorized` error timestamp stops advancing. A stale
-   `last_error_message` may remain temporarily, so judge recovery by the queue
-   trend and timestamp rather than by the text alone. The helper never logs or
-   returns the query credential or any additional query values.
+For a new installation, configure the operator-owned resources and both seed
+and output group IDs, make the bot administrator, and run `setupPoc()` and the
+existing group-verification/bootstrap flow before migration. Groq tagging uses
+`enableGroqTaggingForNewPhotosOnly()` and publishing uses
+`enableOutputPublishing()`. Preserve their cutoff: enabling a feature later
+must not automatically publish or analyze older photos. Do not use the legacy
+`enableGroqTagging()` backfill function for this rollout.
 
-Treat the complete webhook URL as a credential: do not paste it into chat,
-tickets, screenshots, or logs. Do not replace `WEBHOOK_SECRET` while the
-webhook is active: an update arriving between the property change and webhook
-reinstallation could be acknowledged as unauthenticated. Secret rotation is a
-separate ask-first maintenance operation that must pause/delete the webhook
-without dropping pending updates, change the property, and reinstall the new
-credential before Telegram delivery resumes. Do not rotate by editing the
-property first.
+Credential rotation is a separate maintenance operation. Pause/remove the
+webhook without dropping pending updates, have the operator replace the secret
+values, verify the current bot identity, and reinstall the authenticated
+webhook. Never change the webhook secret while delivery is active.
 
-These are operator actions. The local checks in this repository do not prove
-deployment parity, live permissions, or provider behavior.
+## Adding school input groups
 
-The POC uses one Telegram webhook connection so adjacent messages stay ordered.
-Upload the files under `test-images/` from a human account to run the live test.
+A school member adds the bot to an input group and makes it an administrator.
+The bot records the numeric chat ID automatically; private invite hashes are
+not chat IDs and need not be copied into configuration.
 
-## First live test
+The enrollment initiator must currently belong to Elardh_Images_Group and have
+administration or effective invitation authority in the candidate input group.
+Ordinary members with permission to invite are included. Unknown membership or
+permission checks do not authorize capture; the pending enrollment can retry.
+If another administrator later promotes the bot, the original eligible
+initiator remains attached to the enrollment request.
 
-Post each item separately and wait for it to finish uploading:
+The output group can never enroll as an input. Removing or demoting the bot
+suspends new intake. Previously admitted work and already published catalog
+entries remain retained. Adding an arbitrary outsider's group does not make
+its photos school publications.
 
-1. Upload `01-notebooks.png` with the caption `Notebooks caption`.
-2. Send `Plant before`, upload `02-plant-and-book.png`, then send `Plant after`.
-3. Upload `03-globe-and-geometry.png`, then send `Globe after`.
+## Capture, storage and caption edits
 
-Expected: three `Records` rows, three Drive files, both Plant lines attached to
-the second record, and a 👍 reaction on every saved image or associated
-after-line. Replying directly to a photo is also supported.
+The webhook persists one pending record before acknowledging accepted photo
+intake. Its stable ID is `source_chat_id:message_id`. A background archive worker
+then downloads the highest-resolution Telegram photo, validates supported
+JPEG/PNG/WebP bytes and stores it in the private Drive archive. The catalog
+records MIME type, byte size, SHA-256 and completion time. Retries reconcile the
+same deterministic Drive object rather than creating a new image each time.
 
-## School members searching in the output group
+Store full normalized analysis in `ai_metadata_json`, separate from human
+captions and manual tags. Telegram captions are a bounded search projection;
+they are not the authoritative metadata store. Image bytes are unchanged.
+Legacy rows without integrity evidence remain unverified and are excluded from
+the shared teacher catalog.
 
-Members of the configured, verified output group can send `/search كتاب` there.
-`/search@SchoolImages_bot كتاب` is also supported for this bot's current username.
-The bot verifies the sender's current output-group membership for each command;
-members do not need individual `SEARCH_USER_IDS` entries or input-group membership.
-Anonymous administrator/channel senders, bot senders, commands addressed to other
-bots and unrelated groups are ignored. Telegram membership lookup failures deny
-access. The bot must retain administrator rights so membership checks are reliable.
+Original and latest human captions are retained separately from adjacent text.
+A newer caption edit updates the index and schedules an edit to the known
+output message. Removing a caption removes that latest caption from matching;
+old human captions are retained for history rather than silently searched.
+Duplicate and older edit versions do not restore stale text. Caption updates
+never send a replacement photo. A missing output message is a visible failure
+requiring review.
 
-Group results are limited to five healthy archived photos already recorded as
-`PUBLISHED` to this exact output group with an output message ID. Pending, failed,
-unpublished and legacy unverified images are excluded. Results are posted back to
-the same group with protected content, using local caption/tag/OCR ranking. Group
-queries do not activate the optional Gemini pilot. An empty result produces a
-clear response; `/search` alone shows usage. Telegram's built-in group search is
-also available for existing published captions.
+Deleting a photo or message from the input Telegram group does **not** delete
+its Drive archive, metadata or published catalog entry. Source deletion is not
+an archive deletion request. Album photos remain separate records; advanced
+album presentation is deferred.
 
-Private search retains the separate allowlist and input-group membership rules below.
+## Basic image analysis
 
-## Private search baseline
+Groq receives archived images outside the webhook. The current default model
+is `qwen/qwen3.8-27b`; an explicit configured model override is retained. Basic
+analysis produces bilingual descriptions and vocabulary, visible objects,
+activities, settings, topics, colors, a representative OCR excerpt and
+non-personal visual tone. Full-page transcription and advanced OCR are deferred.
 
-Each allowlisted user must open the bot privately and send `/start` once, then
-can run searches such as:
+Do not infer identity, sensitive traits, personal emotions or intent. Strict
+JSON validation rejects malformed or oversized model output. Human captions and
+manual tags are preserved. Provider keys and raw provider responses must never
+enter operational errors or Telegram replies.
 
-```text
-/search Plant
-/search نشاط خيل
+The approved live test uses `test-images/02-plant-and-book.png`. It contains no
+people. That approval does not authorize real school or children images through
+a provider; the school's data-use and provider boundary need separate approval.
+
+## Teacher search
+
+In the bot's private chat, send `/start`, then `/search كتاب`. The same command
+works in Elardh_Images_Group, including `/search@SchoolImages_bot كتاب` for the
+bot's current username. Each request checks the sender's current output-group
+membership. Teachers need neither input-group membership nor an individual
+`SEARCH_USER_IDS` entry. Anonymous/channel senders and commands addressed to
+another bot are ignored.
+
+Both interfaces return at most five healthy archives with confirmed publication
+to the fixed output group and a saved output message ID. Pending, unpublished,
+failed and unverified records are excluded. Suspending an input does not hide
+its previously published photos. Results in the group are visible to that group.
+
+Search is local lexical matching over latest human text, adjacent context,
+manual tags and validated AI metadata/OCR. Conservative Arabic/English stopword
+filtering removes common function words. At least one meaningful term must
+match; coverage, phrase matching and field weights determine order, with stable
+ties. A query containing only stopwords asks for more useful terms. A service
+failure reports temporary unavailability rather than claiming no matches.
+
+There is no semantic similarity percentage or universal cosine cutoff in this
+release. Synonyms work only when present in the indexed vocabulary. Later
+embeddings/reranking need separate model selection and school-query evaluation.
+Telegram's built-in group search can also find published caption terms, but its
+ranking and visibility are separate from `/search`.
+
+## Failures and recovery
+
+Work advances by stage: durable intake → canonical archive → basic analysis or
+caption-only fallback → publication → later caption synchronization. Workers
+claim short leases under locks and perform external calls outside those locks.
+They resume the failed stage rather than repeating the whole workflow.
+
+Temporary failures have five total attempts, with approximately 5, 10, 20 and
+40 minutes between retries. Worker scheduling can make waits longer. Honor a
+longer provider retry-after interval. Unsupported or corrupt images are terminal.
+Invalid credentials, permission loss and storage exhaustion pause the affected
+stage for operator attention instead of exhausting every queued photo's budget.
+
+After transient or invalid-JSON analysis retries exhaust, a healthy eligible
+archive can publish with its latest human caption and an **analysis unavailable**
+marker. It remains searchable through human text. A credential/configuration
+pause does not itself trigger that fallback.
+
+Use `catalogHealth()` for sanitized stage state. After fixing the underlying
+cause, run `recoverCatalogStage('archive')`, `recoverCatalogStage('analysis')`,
+`recoverCatalogStage('publication')` or `recoverCatalogStage('caption')` as
+appropriate. This resumes a paused stage; it is not permission to replay old
+terminal records or ambiguous publications. Use `requestCatalogEnrichment(recordId)`
+for an explicit later analysis attempt on a caption-only record. Successful
+analysis updates that record and the same output message.
+
+The Apps Script Run selector cannot supply function arguments. For a deliberate
+recovery, an editor can temporarily add and run a small wrapper, then remove it:
+
+```javascript
+function operatorRecovery() {
+  console.log(JSON.stringify(recoverCatalogStage('archive')));
+}
 ```
 
-The bot returns at most five protected Telegram photos, strongest match first.
-Each result shows its rank, matched query-term count, tags when available, and
-caption/context. Search fields are weighted in this order:
+Choose the affected stage rather than resuming all stages indiscriminately.
+The same wrapper pattern can call `requestCatalogEnrichment('chat_id:message_id')`
+for the specific reviewed record; never bulk-reset catalog rows.
 
-1. `manual_tags`
-2. `ai_tags`
-3. `ai_caption`
-4. uploader caption and adjacent text
+Confirmed publication stores `output_message_id`; subsequent runs skip first
+publication. Explicit temporary Telegram rejections may retry. A timeout or
+expired photo-send lease becomes `PUBLISH_UNKNOWN`: delivery might have occurred,
+so automatic resend could duplicate it. Inspect and reconcile the output history
+before any separately authorized resend. Caption edits target a known message
+and can safely retry; Telegram's 'message is not modified' response completes
+that synchronization.
 
-When Groq tagging is enabled, each saved image is analyzed outside the Telegram
-webhook. The model writes bilingual captions and search vocabulary plus visible
-objects, activities, settings, topics, colors, OCR text, and non-personal visual
-tone. The complete normalized result is stored in `ai_metadata_json`; existing
-`manual_tags` are never overwritten. `/search` ranks matching images with the
-strongest result first. This is rich lexical search over human and generated
-metadata, not CLIP-style image embeddings, so a query still needs to overlap a
-stored term. Human text is stored as literal Sheet text so formula-looking
-messages cannot execute as spreadsheet formulas.
+`auditArchive()` provides separate archive health evidence. Drive storage is
+not proof of a tested backup; restoration requires a separately selected backup
+and restoration drill.
 
-## Approved Gemini semantic-search pilot
+## Optional semantic pilot
 
-The free-tier pilot is only for synthetic or properly de-identified images and
-preregistered non-sensitive queries. **Do not enable it for real school or
-children photos.** Real imagery requires paid-provider terms plus explicit
-privacy, retention, residency, policy, and consent approval first.
+The older Gemini embedding pilot is retained as an isolated operator experiment;
+teacher `/search` does not invoke it. Its explicit dataset, query, expiry and
+non-sensitive-input approval gates remain mandatory. Do not enable it for real
+school imagery. See the retained pilot spec under
+`_bmad-output/implementation-artifacts/spec-approved-pilot-semantic-search.md`.
 
-Run `setupPoc()` once after updating the source so it creates the separate
-`Embeddings` Sheet. Then add all of these Script Properties:
+## Local verification
 
-- `GEMINI_API_KEY`: the secret key; never store it in code, Sheets, logs, or chat.
-- `GEMINI_PILOT_ENABLED`: exactly `true`.
-- `GEMINI_INPUTS_CONFIRMED_NON_SENSITIVE`: exactly `true`, after privacy review.
-- `GEMINI_PILOT_DATASET_ID`: the approved synthetic/de-identified dataset version.
-- `GEMINI_PILOT_APPROVED_BY`: the privacy approver.
-- `GEMINI_PILOT_APPROVED_AT`: an ISO-8601 timestamp with timezone.
-- `GEMINI_PILOT_EXPIRES_AT`: a future ISO-8601 timestamp with timezone.
-- `GEMINI_PILOT_RECORD_IDS`: comma-separated approved `Records.record_id` values.
-- `GEMINI_PILOT_QUERIES`: one approved query per line.
-- `GEMINI_EMBEDDING_MODEL`: optional; only `gemini-embedding-2` is supported and
-  is the default.
-
-An authorized Apps Script editor manually runs `indexApprovedGeminiPilot()`.
-Each run claims at most two approved photos, performs provider calls outside the
-short Sheet locks, and retries rows marked `ERROR` on a later run. It never
-queues the existing archive automatically and does not depend on Groq tags.
-
-Set `GEMINI_INPUTS_CONFIRMED_NON_SENSITIVE=true` as an additional mandatory
-operator attestation. The pilot fails closed before image or query embedding if
-that exact value is absent. This gate does not classify content; it records the
-privacy owner's decision that the allowlisted inputs are non-sensitive.
-
-For an approved normalized query, `/search` displays `Hybrid pilot` and merges
-lexical/OCR/tag rank with exact cosine-similarity rank. Each record appears once,
-with literal matches weighted slightly more strongly. An unapproved query,
-disabled or expired approval, missing eligible vectors, or provider failure
-uses the existing local search and displays `Lexical fallback` without provider
-details.
-
-To stop external requests, change `GEMINI_PILOT_ENABLED` to anything other than
-`true` or remove it. Existing vectors remain stored but are ineligible while the
-gate is closed. After expiry, removal from the record allowlist, approval
-replacement, or deletion of a source Photo Record, run
-`purgeRevokedGeminiPilotEmbeddings()` to clear vector data and retain its audit
-provenance as `REVOKED`.
-
-Run the local check below before the manual synthetic pilot. It makes no Gemini
-request. A real Apps Script run is integration evidence only; bilingual quality,
-latency, failure-rate, and cost claims require the separate preregistered pilot
-benchmark.
-
-## Optional Groq image tagging
-
-Groq receives each queued image, so obtain the required school/privacy approval
-before enabling it. In the Groq Console, enable Zero Data Retention for the
-project when available.
-
-1. Create a Groq API key.
-2. Open the Apps Script project and select **Project Settings**.
-3. Under **Script Properties**, add:
-
-   - `GROQ_API_KEY` = your secret Groq key
-   - `GROQ_MODEL` = `qwen/qwen3.8-27b` (optional; this is the default)
-
-   Groq retired `qwen/qwen3.6-27b` for free/developer usage on September 14,
-   2026; see its [model deprecation notice](https://console.groq.com/docs/deprecations).
-   An explicit property override is preserved, so update an old override yourself.
-   The image prompt bounds captions, vocabulary lists and representative OCR
-   excerpts to the validator's limits; full-page transcription is not requested.
-
-4. Never put the key in this repository, the Google Sheet, or a Telegram
-   message.
-5. For this rollout, run `enableGroqTaggingForNewPhotosOnly()` once and approve
-   the requested permissions. It stores a UTC cutoff, creates or repairs the
-   five-minute worker, returns `queued: 0` and `processed_immediately: 0`, and
-   never queues an old row. Eligibility uses each photo's Telegram
-   `message.date`, not `update_id`; delayed pre-activation updates remain outside
-   the cutoff. Re-running the function safely preserves an existing valid
-   cutoff. It refuses activation while a live `TAGGING` lease exists.
-6. The older `enableGroqTagging()` explicitly enables `LEGACY_BACKFILL`, queues
-   existing untagged photos, and attempts a first batch. Do not use it for this
-   rollout. Missing, corrupt, or incomplete mode/cutoff properties fail closed.
-7. Check the `Records.processing_status` column:
-
-   - `TAG_NOT_ELIGIBLE`: captured outside the armed new-photo-only boundary
-   - `TAG_PENDING`: waiting
-   - `TAGGING`: currently leased by a worker
-   - `TAG_RETRY`: temporary API/rate-limit failure; automatic retry scheduled
-   - `TAGGED`: `ai_tags` and `ai_caption` are ready for `/search`
-
-Activation records the exact managed trigger UID. Any legacy trigger owned by a
-different Google account remains inert because its UID cannot pass the worker
-gate, even if that account's trigger is still visible in Apps Script.
-   - `TAG_ERROR`: permanent failure or five failed attempts; inspect `error`
-
-Run `disableGroqTagging()` to remove the worker and stop new Groq calls. Photo
-capture and existing `/search` results continue working while tagging is
-disabled.
-
-## Separate searchable output group
-
-The optional output workflow copies a newly captured and successfully enriched
-photo to one explicit archive group. Telegram does not search hidden EXIF/image
-metadata, so the complete normalized metadata remains in the `Records` Sheet
-while a deterministic search projection is placed in the output photo caption.
-The caption prioritizes English and Arabic captions and vocabulary, then OCR,
-activity/setting, colors/visual tone, and original human context. It is plain
-text, uses complete Unicode code points and whole words/phrases, and is always at
-most Telegram's 1024-character caption limit. The image bytes/content are not
-edited. Provider metadata that has missing/wrong fields, wrong language scripts,
-oversized values, or excessive list counts is rejected instead of silently
-truncated before durable storage.
-
-Real school or children photos must not be sent to Groq until the school Privacy
-Owner has approved the provider boundary, retention, residency, policy, and
-consent requirements. The analysis requests only visibly supported content. It
-must not identify people or infer names, emotions, intent, relationships, or
-sensitive traits.
-
-## Canonical archive and processing states
-
-Telegram is the ingestion/publication interface and a fast delivery cache; it
-is not the system of record. Drive holds the immutable canonical image bytes,
-Sheets hold workflow and metadata, Groq/Gemini outputs are rebuildable
-derivatives, and the output group is a regenerable searchable projection.
-
-Every new accepted photo is downloaded once and validated before AI work. The
-bot records `archive_mime_type`, `archive_byte_size`, `archive_sha256`,
-`archive_status`, `archive_error`, and `archive_completed_at_utc`. Only an
-`ARCHIVED` row with complete integrity evidence is eligible for Groq, Gemini,
-publication, normal search delivery, or Drive fallback. A failed capture is
-tracked with `archive_attempts` and `archive_next_attempt_utc`. Transient
-failures use bounded `ARCHIVE_RETRY`; unsupported/corrupt bytes, ambiguous
-duplicate Drive objects, or exhausted retries use `ARCHIVE_FAILED_TERMINAL`.
-A Telegram redelivery retries capture only after `archive_next_attempt_utc` is
-due. Earlier deliveries and missing/invalid retry deadlines do not consume an
-attempt or complete the photo event. This relies on Telegram redelivery; there
-is no independent archive retry worker. A record left after Telegram stops
-retrying requires operator review before any replay.
-A redelivered update can reconcile the same deterministic Drive object and
-record without creating a duplicate.
-
-Legacy rows with a Drive ID but no integrity fields are reported as
-`LEGACY_UNVERIFIED`. They are excluded by default. An operator may temporarily
-set `ALLOW_LEGACY_UNVERIFIED_LEXICAL_SEARCH=true` to expose them to lexical
-search only; they remain ineligible for AI, semantic results, and publication.
-
-Run `auditArchive()` from Apps Script for a non-sending health report. It reads
-the Records ledger and Drive object metadata and classifies healthy records,
-legacy rows, archive failures, incomplete rows, missing objects, and byte-size
-conflicts. It does not prove a backup. Irreplaceable images still require a
-separately selected backup target and a captured restoration test.
-
-The lifecycle is deliberately ordered:
-
-```text
-Telegram input → Drive original + integrity → Groq metadata validation
-               → lexical/semantic indexes → Telegram output publication
-```
-
-Before enabling the feature:
-
-1. Run `setupPoc()` after updating the source. It expands the `Records` Sheet to
-   the append-only 45-column schema. Existing 24- or 37-column layouts migrate
-   by appending headers only. If extension columns contain data under unrelated
-   headers, setup fails closed and does not relabel that data.
-2. Add the existing bot to both private groups using Telegram itself. In
-   BotFather, use `/mybots` to confirm its exact `@username` without copying its
-   token. In each group, open the group title, choose **Add Members**, and add
-   that username. Make the bot an administrator in both groups with only the
-   permissions it needs: ordinary photo visibility in input, and message/media
-   sending in output. Do not grant user-management or group-settings rights.
-
-   Obtain each numeric ID without a third-party bot:
-
-   - Send one harmless text message in each group, then use **Copy Message Link**
-     on that message. This is not the private invite link.
-   - A private supergroup link such as `https://t.me/c/1940123456/27` maps to Bot
-     API chat ID `-1001940123456`. Apply this conversion independently to each
-     group's own message link.
-   - If Telegram does not produce the `/c/<number>/<message>` form, stop. Do not
-     guess from a `t.me/+...` invite hash and do not use a third-party ID bot.
-3. Set `ALLOWED_CHAT_ID` explicitly to the input group or supergroup numeric ID.
-   Set `OUTPUT_CHAT_ID` explicitly to the output group or supergroup numeric ID.
-   Both must use canonical negative form such as `-1001234567890`—no zero or
-   leading zeros—and they must differ.
-4. Ensure output publishing is disabled, then run `verifyOutputGroups()`. It
-   makes non-sending `getMe`, `getChat`, and `getChatMember` calls; requires the
-   current bot to be administrator/creator in both groups; and returns the bot
-   identity plus both resolved group titles. Compare those titles and IDs with
-   the intended input/output groups before continuing. The managed verification
-   marker is bound to both IDs and a one-way fingerprint of the current bot
-   token, so changing IDs or rotating the token requires verification again. Do
-   not create or edit this marker manually.
-5. Configure and approve Groq as described above. Run
-   `enableGroqTaggingForNewPhotosOnly()` so the API key, explicit mode, UTC
-   cutoff, and worker are all valid while old rows remain unclaimable. The
-   function requires Telegram `pending_update_count=0`; after it returns, wait
-   until the returned `activated_after_message_date` has passed before sending
-   the synthetic test photo. A photo from the cutoff's exact second is rejected
-   conservatively.
-6. Run `enableOutputPublishing()`. It rechecks the exact verification marker and
-   Groq configuration, sets `OUTPUT_PUBLISHING_ENABLED=true`, and installs an
-   independent five-minute `processPendingPublications` trigger. It returns
-   `backfilled: 0` and never changes old rows.
-
-If output publishing is disabled, either group ID is missing/invalid, the IDs
-are equal, the exact verification marker is absent/stale, or Groq enrichment is
-not fully enabled at capture time, capture still works but that photo is not a
-publication candidate. Fixing configuration later does not backfill it. Only
-photos captured while the complete feature configuration is valid receive
-`publish_eligible_at_utc`; existing rows and earlier captures are never
-auto-published.
-
-`processPendingTags()` performs only Groq work. The independent publication
-trigger advances `PUBLISH_PENDING` and due `PUBLISH_RETRY` rows even if Groq is
-disabled later. An operator may also run `processPendingPublications()`
-explicitly. Run `disableOutputPublishing()` to close the publishing gate and
-remove only the publication trigger; it does not alter existing records or the
-Groq trigger. Both Groq and Telegram network calls occur outside short Sheet
-locks.
-
-Publication waits at least 20 seconds after capture before claiming a row. This
-settling window lets an immediately following same-user text line attach to the
-photo and enter the deterministic caption before delivery.
-
-Publication states in `Records.publish_status` are:
-
-- blank: output publishing was disabled when the photo was captured.
-- `PUBLISH_NOT_ELIGIBLE`: publishing was enabled but configuration was invalid
-  at capture time; this row will not be backfilled.
-- `PUBLISH_WAITING_FOR_ENRICHMENT`: a new eligible photo is waiting for Groq.
-- `PUBLISH_PENDING`: complete metadata is stored and delivery may be claimed.
-- `PUBLISHING`: a short-lived worker claim exists; the network call is outside
-  the lock.
-- `PUBLISH_RETRY`: Telegram explicitly rejected the request with a definitely
-  unsent transient response; bounded retry is scheduled.
-- `PUBLISHED`: `output_message_id`, `published_at_utc`, and the exact
-  `publish_caption` were stored; later workers skip it.
-- `PUBLISH_BLOCKED_ENRICHMENT` or `PUBLISH_FAILED`: enrichment or publication
-  ended permanently and requires operator review.
-- `PUBLISH_UNKNOWN`: the request may have reached Telegram but its outcome could
-  not be proved, including a transport timeout or expired delivery claim. It is
-  never replayed automatically because replay could create a duplicate.
-
-For `PUBLISH_UNKNOWN`, inspect the output group and Telegram message history
-first. Do not reset or replay the row unless an authorized operator has proved
-that no message was delivered; ambiguous replay remains an ask-first action.
-Changing `OUTPUT_CHAT_ID`, publishing old rows, or sending real photos also
-requires explicit approval.
-
-This repository change does not deploy Apps Script, install a trigger, change
-Script Properties, or perform live Telegram/Groq/Gemini calls. Those integration
-steps and output-group permissions remain unverified until an approved operator
-performs the non-destructive configuration checklist above.
-
-## Local check
+Run every registered check and syntax validation before deployment:
 
 ```powershell
-node tests/self_check.js
-node tests/archive_retry_check.js
-node tests/workflow_recovery_check.js
-node tests/output_group_search_check.js
-node tests/archive_mime_check.js
+Get-ChildItem tests -Filter '*_check.js' | ForEach-Object {
+    node $_.FullName
+    if ($LASTEXITCODE -ne 0) { throw "Failed: $($_.Name)" }
+}
 Get-Content -Raw -LiteralPath 'apps-script\Code.gs' | node --check -
+git diff --check
 ```
+
+Offline fixtures prove the cases they exercise. Live synthetic capture/search
+proves that specific deployed path; neither proves school-corpus relevance,
+live enrollment in several groups, or approval for real school data.

@@ -102,11 +102,10 @@ for (const text of ['/search', '/search ' + 'a'.repeat(201), '/search لايوج
 }
 f = fixture();
 f.run({ chat: { id: 42, type: 'private' } });
-assert.strictEqual(f.readCount(), 0);
-assert.ok(f.sends.every(x => x.method !== 'sendPhoto'));
+assert.strictEqual(f.run({ chat: { id: 42, type: 'private' } }, 11), 'search-results');
 f = fixture(); f.config.searchUserIds = ['42'];
 assert.strictEqual(f.run({ chat: { id: 42, type: 'private' } }), 'search-results');
-assert.strictEqual(f.memberships[0].chat_id, '-1001');
+assert.strictEqual(f.memberships[0].chat_id, '-1002');
 assert.ok(f.sends.every(x => x.payload.chat_id === '42'));
 // More than five real matches still sends only the bounded result count.
 f = fixture(); for (let i = 0; i < 8; i++) f.rows.push(f.row('more-' + i));

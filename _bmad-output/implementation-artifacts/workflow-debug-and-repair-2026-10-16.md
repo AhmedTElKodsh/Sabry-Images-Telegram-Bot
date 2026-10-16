@@ -1,5 +1,63 @@
 # Workflow investigation and repair — October 16, 2026
 
+## Shared school catalog upgrade — final release 7
+
+The approved shared-catalog implementation is deployed to the existing endpoint
+as **version 7**, October 16 at 16:59 Cairo time. It adds authorized multi-input
+enrollment, durable intake/archive workers, caption versions/synchronization,
+analysis fallback, shared teacher access and stage recovery. All nine local
+`tests/*_check.js` suites, source syntax and whitespace checks pass. Four independent
+review lenses completed; verified findings and repairs are recorded individually
+in `spec-shared-school-catalog.md`.
+
+Final reviewed local and saved editor source match after CRLF normalization:
+`4d6758da64525426068f7e5644a9ac25ff8d492235b5540f09ae5cc779d7347f`.
+Temporary operator probes were removed before the immutable release. No credential
+settings page was opened, and no credential values were printed or added to files.
+
+### Live evidence
+
+| Check | Observed result |
+|---|---|
+| Controlled maintenance | Tagging/publication workers paused before source replacement; webhook deleted with `drop_pending_updates: false`. Delivery restored after migration/deployment. |
+| Migration | Guarded migration returned `existing_rows_preserved: true` for all seven existing records and their original 45 columns. Schema now has 62 Records columns and eight Groups columns. One verified existing input seeded; output resolved as Elardh_Images_Group. |
+| Durable intake | Fresh approved plant/book fixture, input record `-1004439324869:11`, appeared as ARCHIVE_PENDING with its original caption and frozen eligibility before download/analysis. |
+| Pipeline | Independent archive run completed at 16:42:38; analysis at 16:43:22; publication at 16:44:17. The record became ARCHIVED, TAGGED and PUBLISHED with healthy canonical integrity and output message ID 20. |
+| Retention | Prior healthy record 10 remains published as output message 12. Legacy/unverified and failed rows were not replayed. |
+| Shared search | Output command 21 `/search كتاب` returned two photos as messages 22/23. Private command 4668 returned two photos as messages 4669/4670. Both interfaces used the confirmed-published catalog. |
+| Caption edit/index | Input message 11 was edited with the unique term `فهرسةمدرسية`. Group command 24 returned one photo as message 25; private command 4671 returned one as message 4672. Original human caption remained retained. |
+| Caption display repair | The first live edit exposed AI sections crowding human context out of the Telegram caption budget. Version 6 reserves human text first. A second source edit added `فهرسةمدرسية مراجعة`; the original output message 20 visibly contains the complete short edited caption and persisted SYNCED state. No replacement photo was published. |
+| Repeated workers | At 16:54:28, archive/analysis/publication/caption workers all processed zero records; all saved publication IDs remained unchanged. Five managed handlers were present, webhook active, pending update count zero, no stage paused. |
+| Final version smoke | After version 7 deployment, group command 26 for `فهرسةمدرسية` returned one photo as message 27. Corresponding deployed doPost at 16:59:35 completed in 4.023 seconds. |
+
+Version 7 also repairs established-cutoff resumption during shared-catalog
+maintenance. The legacy enable helper advanced the global cutoff when tagging
+was first re-enabled in this upgrade; the queue was empty and retained record
+eligibility/publication IDs were unaffected. The exact previous global cutoff
+was not captured, so its historical preservation is not claimed. The corrected
+path preserves an existing canonical boundary even after temporary disablement
+and permits already queued updates during resumption. First activation and invalid
+boundaries still require an empty queue. This repair has focused offline coverage;
+the final smoke test did not intentionally interrupt delivery again.
+
+### Limits and retained history
+
+- Several-input authorization/routing, add/promote/remove ordering, token rotation,
+  lease contention, rate/auth failures, exhausted-analysis fallback and later
+  enrichment are covered by offline fixtures. Live acceptance used the existing
+  ImageBot_test group; a second real input enrollment was not performed.
+- Live analysis succeeded. Caption-only fallback and outage recovery were not
+  forced against real providers or credentials.
+- The signed-in teacher account performed live searches. Additional-member access
+  and denial variants are covered offline; no second human account was used.
+- Three old ARCHIVE_RETRY rows lack new admission evidence and remain historical
+  failures requiring separate review. Another old archive is terminal; two legacy
+  records are unverified. Health totals include that retained history. The fresh
+  record has no pending archive/publication/caption work.
+- No real school/children image test, advanced OCR, embedding/reranking evaluation,
+  school-corpus relevance benchmark, restoration drill or hosting migration was
+  performed. Drive retention was preserved; source deletion does not request archive deletion.
+
 ## Latest live acceptance — school group search
 
 The user approved implementing shared output-group bot search and a full safe-photo

@@ -48,7 +48,7 @@ s.UrlFetchApp.fetch = () => ({ getResponseCode: () => 401, getContentText: () =>
 assert.throws(() => s.fetchOk_('https://example.com'), /^Error: HTTP 401: provider request failed\.$/);
 s.UrlFetchApp.fetch = () => ({ getResponseCode: () => 200,
   getContentText: () => JSON.stringify({ ok: false, description: sensitive }) });
-assert.throws(() => s.telegram_('getMe', {}, 'fake-token'), /^Error: Telegram getMe failed\.$/);
+assert.throws(() => s.telegram_('getMe', {}, 'fake-token'), /^Error: Telegram request failed\.$/);
 s.UrlFetchApp.fetch = () => ({ getResponseCode: () => 200, getContentText: () => sensitive });
 assert.throws(() => s.telegram_('getMe', {}, 'fake-token'),
   /^Error: Telegram getMe returned invalid response JSON\.$/);

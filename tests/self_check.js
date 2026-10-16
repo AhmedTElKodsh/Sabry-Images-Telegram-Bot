@@ -266,7 +266,7 @@ if (installCallOrder.join(',') !== 'verifyAdmin,setWebhook' ||
     !setWebhookCall || setWebhookCall.token !== 'test-bot-token' ||
     setWebhookCall.payload.url !==
       `https://script.google.com/macros/s/deployment/exec?telegram_webhook_key=${webhookSecret}` ||
-    setWebhookCall.payload.allowed_updates !== JSON.stringify(['message']) ||
+    setWebhookCall.payload.allowed_updates !== JSON.stringify(['message', 'edited_message', 'my_chat_member']) ||
     setWebhookCall.payload.max_connections !== 1 ||
     setWebhookCall.payload.drop_pending_updates !== false) {
   console.error('FAIL: installWebhook changed validation order, URL, queue, or update policy');

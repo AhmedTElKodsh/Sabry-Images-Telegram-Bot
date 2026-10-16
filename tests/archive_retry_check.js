@@ -1,78 +1,55 @@
-const assert = require('assert');
-const fs = require('fs');
-const vm = require('vm');
-const sandbox = { console };
-vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync('apps-script/Code.gs', 'utf8'), sandbox);
-const field = vm.runInContext('RECORD_FIELD', sandbox);
-const row = new Array(45).fill('');
-row[field.ARCHIVE_STATUS] = 'ARCHIVE_RETRY';
-row[field.ARCHIVE_ATTEMPTS] = 1;
-row[field.ARCHIVE_NEXT_ATTEMPT_UTC] = new Date(Date.now() + 3600000).toISOString();
-let storageCalls = 0;
-let writes = 0;
-let events = 0;
-sandbox.findRecordRow_ = () => 2;
-sandbox.findEventRow_ = () => null;
-sandbox.Utilities = { formatDate: () => new Date().toISOString() };
-sandbox.storePhoto_ = () => { storageCalls++; throw new Error('temporary failure'); };
-const records = { getRange: () => ({
-  getValues: () => [row],
-  setValues: (values) => { writes++; row.splice(0, row.length, ...values[0]); }
-}) };
-const eventSheet = { appendRow: () => { events++; } };
-const message = { chat: { id: -1001 }, message_id: 1, date: 1, from: { id: 2 },
-  photo: [{ file_id: 'f', file_unique_id: 'u', width: 1, height: 1 }] };
-const process = () => sandbox.processPhoto_({ update_id: 1 }, message, records, eventSheet, {});
-for (const deadline of [row[field.ARCHIVE_NEXT_ATTEMPT_UTC], '', 'invalid',
-  0, false, [], ['2000-01-01'], '0', '2000-02-30T00:00:00.000Z',
-  '2000-01-01', '2000-01-01T00:00:00.000+00:00']) {
-  row[field.ARCHIVE_NEXT_ATTEMPT_UTC] = deadline;
-  for (let delivery = 0; delivery < 5; delivery++) {
-    assert.throws(process, /retry is not due or its deadline is invalid/);
-  }
+const assert = require('assert'), {runtime} = require('./catalog_fixture');
+let f=runtime(), {s,F,records,events,message,config}=f;
+let calls=0; s.storePhoto_=()=>{calls++; throw Error('temporary');};
+assert.equal(s.processPhoto_({update_id:1},message,records,events,config),'saved');
+assert.equal(calls,0,'intake must not download');
+assert.equal(records.data.length,2); assert.equal(records.data[1][F.ARCHIVE_STATUS],'ARCHIVE_PENDING');
+assert.equal(s.processPhoto_({update_id:1},message,records,events,config),'duplicate-record');
+assert.equal(records.data.length,2);
+s.processPendingArchives(); assert.equal(calls,1); assert.equal(records.data[1][F.ARCHIVE_ATTEMPTS],1);
+assert.equal(records.data[1][F.ARCHIVE_STATUS],'ARCHIVE_RETRY');
+assert.ok(Date.parse(records.data[1][F.ARCHIVE_NEXT_ATTEMPT_UTC])-Date.now()>299000);
+s.processPendingArchives(); assert.equal(calls,1);
+for(let attempt=2;attempt<=5;attempt++) {
+ records.data[1][F.ARCHIVE_NEXT_ATTEMPT_UTC]='2000-01-01T00:00:00.000Z';
+ s.processPendingArchives(); assert.equal(records.data[1][F.ARCHIVE_ATTEMPTS],attempt);
 }
-assert.deepStrictEqual([storageCalls, writes, events, row[field.ARCHIVE_ATTEMPTS]], [0, 0, 0, 1]);
-row[field.ARCHIVE_NEXT_ATTEMPT_UTC] = '2000-01-01T00:00:00.000Z';
-assert.throws(process, /temporary failure/);
-assert.strictEqual(row[field.ARCHIVE_ATTEMPTS], 2);
-assert.ok(Date.parse(row[field.ARCHIVE_NEXT_ATTEMPT_UTC]) > Date.now());
-assert.throws(process, /retry is not due/);
-assert.strictEqual(storageCalls, 1);
-// A due successful retry still completes the same row and event once.
-row[field.ARCHIVE_NEXT_ATTEMPT_UTC] = '2000-01-01T00:00:00.000Z';
-sandbox.storePhoto_ = () => { storageCalls++; return {
-  id: 'drive-id', url: 'drive-url', mimeType: 'image/jpeg', byteSize: 6,
-  sha256: 'a'.repeat(64), completedAtUtc: new Date().toISOString()
-}; };
-sandbox.tagStatusForCapture_ = () => 'TAG_NOT_ELIGIBLE';
-sandbox.publicationEligibilityForCapture_ = () => ({ eligibleAt: '', status: '', outputChatId: '', error: '' });
-assert.strictEqual(process(), 'archive-recovered');
-assert.strictEqual(row[field.ARCHIVE_STATUS], 'ARCHIVED');
-assert.strictEqual(row[field.ARCHIVE_NEXT_ATTEMPT_UTC], '');
-assert.strictEqual(events, 1);
-// Legacy failures have no deadline; existing compatibility must survive.
-row[field.ARCHIVE_STATUS] = 'ARCHIVE_FAILED';
-assert.strictEqual(process(), 'archive-recovered');
-// A real fifth failure becomes terminal; further redelivery cannot call storage.
-row[field.ARCHIVE_STATUS] = 'ARCHIVE_RETRY';
-row[field.ARCHIVE_ATTEMPTS] = 4;
-row[field.ARCHIVE_NEXT_ATTEMPT_UTC] = '2000-01-01T00:00:00.000Z';
-sandbox.storePhoto_ = () => { storageCalls++; throw new Error('temporary failure'); };
-assert.throws(process, /temporary failure/);
-assert.strictEqual(row[field.ARCHIVE_STATUS], 'ARCHIVE_FAILED_TERMINAL');
-const finalCalls = storageCalls;
-assert.throws(process, /terminal state/);
-assert.strictEqual(storageCalls, finalCalls);
-// Neither the error ledger nor the rethrown execution error may carry a transport token.
-row[field.ARCHIVE_STATUS] = 'ARCHIVE_RETRY';
-row[field.ARCHIVE_ATTEMPTS] = 0;
-row[field.ARCHIVE_NEXT_ATTEMPT_UTC] = '2000-01-01T00:00:00.000Z';
-sandbox.storePhoto_ = () => {
-  throw new Error('Request failed: https://api.telegram.org/file/bot123456:FAKE_TOKEN/p.jpg');
-};
-assert.throws(process, error => !error.message.includes('FAKE_TOKEN') &&
-  error.message.includes('[REDACTED_URL]'));
-assert.ok(!String(row[field.ARCHIVE_ERROR]).includes('FAKE_TOKEN'));
-assert.strictEqual(row[field.ARCHIVE_STATUS], 'ARCHIVE_RETRY');
-console.log('PASS: archive retry redelivery checks');
+assert.equal(records.data[1][F.ARCHIVE_STATUS],'ARCHIVE_FAILED_TERMINAL');
+s.processPendingArchives(); assert.equal(calls,5);
+// Crash after durable intake, before Events save; redelivery does not duplicate work.
+f=runtime(); f.events.appendRow=()=>{throw Error('crash after intake');};
+assert.throws(()=>f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config),/crash/);
+assert.equal(f.records.data.length,2); f.events.appendRow=()=>{};
+f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config);
+assert.equal(f.records.data.length,2);
+f.s.storePhoto_=()=>f.archive; f.s.processPendingArchives();
+assert.equal(f.records.data[1][f.F.ARCHIVE_STATUS],'ARCHIVED');
+// A suspended group does not cancel admitted work; activation cannot grant old receipts eligibility.
+f=runtime(); f.config.outputPublishingEnabled=false; f.config.groqTaggingEnabled=false;
+f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config);
+f.config.outputPublishingEnabled=true; f.s.storePhoto_=()=>f.archive; f.s.processPendingArchives();
+assert.equal(f.records.data[1][16],'TAG_NOT_ELIGIBLE');
+assert.equal(f.records.data[1][f.F.PUBLISH_STATUS],'PUBLISH_NOT_ELIGIBLE');
+// Credential outage refunds the attempt and pauses the stage for explicit operator recovery.
+f=runtime(); f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config);
+f.s.storePhoto_=()=>{let e=Error('secret'); e.httpStatus=401; throw e;};
+f.s.processPendingArchives(); assert.equal(f.records.data[1][f.F.ARCHIVE_ATTEMPTS],0);
+assert.ok(f.s.catalogHealth().find(r=>r.stage==='archive').paused);
+assert.ok(!JSON.stringify(f.s.catalogHealth()).includes('secret'));
+f.s.recoverCatalogStage('archive'); f.s.storePhoto_=()=>f.archive;
+f.s.processPendingArchives(); assert.equal(f.records.data[1][f.F.ARCHIVE_STATUS],'ARCHIVED');
+// An archive lease prevents concurrent workers, and an obsolete claim cannot save.
+f=runtime();f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config);
+let concurrent=0;
+f.s.storePhoto_=()=>{concurrent++;assert.equal(f.s.processPendingArchives().processed,0);return f.archive;};
+f.s.processPendingArchives();assert.equal(concurrent,1);
+f=runtime();f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config);
+f.s.storePhoto_=()=>{f.records.data[1][f.F.ARCHIVE_CLAIM_ID]='replacement';return f.archive;};
+f.s.processPendingArchives();assert.equal(f.records.data[1][f.F.ARCHIVE_STATUS],'ARCHIVING');
+assert.equal(f.records.data[1][13],'');
+// Analysis admission is independent of publication admission.
+f=runtime();f.config.outputPublishingEnabled=false;
+f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config);
+f.s.storePhoto_=()=>f.archive;f.s.processPendingArchives();assert.equal(f.records.data[1][16],'TAG_PENDING');
+assert.equal(f.records.data[1][f.F.PUBLISH_STATUS],'PUBLISH_NOT_ELIGIBLE');
+console.log('PASS: durable intake, worker crash recovery, five attempts, receipt eligibility and stage recovery');

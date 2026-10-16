@@ -11,7 +11,11 @@ const RECORD_HEADERS = [
   'output_message_id', 'published_at_utc', 'publish_error', 'publish_caption',
   'archive_mime_type', 'archive_byte_size', 'archive_sha256',
   'archive_status', 'archive_error', 'archive_completed_at_utc',
-  'archive_attempts', 'archive_next_attempt_utc'
+  'archive_attempts', 'archive_next_attempt_utc',
+  'admitted_group_id', 'admitted_at_utc', 'intake_json', 'archive_claim_id',
+  'archive_lease_until_utc', 'original_caption', 'latest_caption', 'caption_version',
+  'adjacent_after_text', 'caption_sync_status', 'caption_sync_attempts',
+  'caption_sync_next_attempt_utc', 'caption_sync_claim_id', 'caption_sync_lease_until_utc', 'analysis_admitted_at_utc', 'tag_claim_id', 'caption_sync_error'
 ];
 
 const RECORD_FIELD = {
@@ -35,7 +39,13 @@ const RECORD_FIELD = {
   ARCHIVE_ERROR: 41,
   ARCHIVE_COMPLETED_AT_UTC: 42,
   ARCHIVE_ATTEMPTS: 43,
-  ARCHIVE_NEXT_ATTEMPT_UTC: 44
+  ARCHIVE_NEXT_ATTEMPT_UTC: 44,
+  ADMITTED_GROUP_ID: 45, ADMITTED_AT_UTC: 46, INTAKE_JSON: 47,
+  ARCHIVE_CLAIM_ID: 48, ARCHIVE_LEASE_UNTIL_UTC: 49,
+  ORIGINAL_CAPTION: 50, LATEST_CAPTION: 51, CAPTION_VERSION: 52,
+  ADJACENT_AFTER_TEXT: 53, CAPTION_SYNC_STATUS: 54, CAPTION_SYNC_ATTEMPTS: 55,
+  CAPTION_SYNC_NEXT_ATTEMPT_UTC: 56, CAPTION_SYNC_CLAIM_ID: 57,
+  CAPTION_SYNC_LEASE_UNTIL_UTC: 58, ANALYSIS_ADMITTED_AT_UTC: 59, TAG_CLAIM_ID: 60, CAPTION_SYNC_ERROR: 61
 };
 
 const EVENT_HEADERS = [
@@ -158,9 +168,6 @@ function doPost(e) {
   if (!lock.tryLock(10000)) throw new Error('Webhook is busy; retry this update.');
   try {
     const config = getConfig_(false);
-    if (!config.allowedChatId) {
-      return HtmlService.createHtmlOutput('ignored');
-    }
     processUpdate_(update, config);
   } finally {
     lock.releaseLock();
@@ -170,22 +177,26 @@ function doPost(e) {
 }
 
 function processUpdate_(update, config) {
-  const message = update.message;
+  if (update.my_chat_member) return processEnrollment_(update, config);
+  const message = update.edited_message || update.message;
   if (!message) return 'ignored';
-  if (isPrivateMessage_(message)) {
-    return processPrivateCommand_(update, message, config);
-  }
+  if (isPrivateMessage_(message)) return processPrivateCommand_(update, message, config);
   if (isGroupMessage_(message) && String(message.chat.id) === config.outputChatId) {
     return processOutputGroupCommand_(update, message, config);
   }
-  if (String(message.chat.id) !== config.allowedChatId) return 'ignored';
-
+  if (!isGroupMessage_(message)) return 'ignored';
   const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
   const records = spreadsheet.getSheetByName('Records');
   const events = spreadsheet.getSheetByName('Events');
   if (!records || !events) throw new Error('Run setupPoc() first.');
   if (hasUpdate_(events, update.update_id)) return 'duplicate';
-
+  // An edit can update admitted work after suspension; it cannot admit a photo.
+  if (update.edited_message) {
+    const known = groupRows_(spreadsheet).some(function (row) { return String(row[0]) === String(message.chat.id); });
+    if (!known) return 'ignored';
+    return processCaptionEdit_(update, message, records, events);
+  }
+  if (!inputGroupIsActive_(spreadsheet, String(message.chat.id), config)) return 'ignored';
   if (message.photo && message.photo.length) {
     const outcome = processPhoto_(update, message, records, events, config);
     reactSaved_(message, config);
@@ -202,10 +213,16 @@ function processUpdate_(update, config) {
 function processPrivateCommand_(update, message, config) {
   const command = privateCommand_(message);
   if (!command) return 'unsupported';
-  if (!isSearchUser_(message, config.searchUserIds)) {
-    sendText_(message.chat.id, 'This Telegram account is not authorized.', config);
-    return 'unauthorized';
-  }
+  if (message.sender_chat || !message.from || message.from.is_bot !== false) return 'unauthorized';
+  try {
+    requireVerifiedOutputGroups_(config);
+    const addressed = firstLine_(message.text || '').match(/^\/\w+@([A-Za-z0-9_]+)/);
+    if (addressed) {
+      const me = telegram_('getMe', {}, config.botToken).result;
+      if (!me || me.is_bot !== true || !me.username ||
+          addressed[1].toLowerCase() !== String(me.username).toLowerCase()) return 'ignored';
+    }
+  } catch (error) { return 'unauthorized'; }
   if (!isCurrentSearchGroupMember_(getUserId_(message), config)) {
     sendText_(message.chat.id, 'This Telegram account is not authorized.', config);
     return 'unauthorized';
@@ -240,11 +257,16 @@ function processOutputGroupCommand_(update, message, config) {
 }
 
 function processSearchCommand_(update, message, config, command, outputGroupSearch) {
-  const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
-  const records = spreadsheet.getSheetByName('Records');
-  const events = spreadsheet.getSheetByName('Events');
-  if (!records || !events) throw new Error('Run setupPoc() first.');
-  if (hasUpdate_(events, update.update_id)) return 'duplicate';
+  let spreadsheet, records, events;
+  try {
+    spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+    records = spreadsheet.getSheetByName('Records'); events = spreadsheet.getSheetByName('Events');
+    if (!records || !events) throw new Error('Catalog unavailable.');
+    if (hasUpdate_(events, update.update_id)) return 'duplicate';
+  } catch (error) {
+    sendText_(message.chat.id, 'Search is temporarily unavailable. Please try again later.', config);
+    return 'search-unavailable';
+  }
 
   if (command.name === 'start') {
     sendText_(
@@ -267,11 +289,17 @@ function processSearchCommand_(update, message, config, command, outputGroupSear
     return 'search-too-long';
   }
 
-  const search = outputGroupSearch
-    ? { mode: 'Lexical fallback', results: searchPublishedGroupRecords_(
-      records, command.query, 5, config
-    ) }
-    : searchWithGeminiFallback_(spreadsheet, records, command.query, 5);
+  if (!meaningfulQueryTokens_(command.query).length) {
+    sendText_(message.chat.id, 'Please use useful search terms, such as an activity or object.', config);
+    return 'search-usage';
+  }
+  let search;
+  try {
+    search = { mode: 'Basic search', results: searchPublishedGroupRecords_(records, command.query, 5, config) };
+  } catch (error) {
+    sendText_(message.chat.id, 'Search is temporarily unavailable. Please try again later.', config);
+    return 'search-unavailable';
+  }
   const results = search.results;
   if (!results.length) {
     sendText_(
@@ -280,10 +308,15 @@ function processSearchCommand_(update, message, config, command, outputGroupSear
       config
     );
   } else {
-    results.forEach(function (result, index) {
-      result.searchMode = search.mode;
-      sendSearchPhoto_(message.chat.id, result, index, results.length, config);
-    });
+    try {
+      results.forEach(function (result, index) {
+        result.searchMode = search.mode;
+        sendSearchPhoto_(message.chat.id, result, index, results.length, config);
+      });
+    } catch (error) {
+      sendText_(message.chat.id, 'Search is temporarily unavailable. Please try again later.', config);
+      return 'search-unavailable';
+    }
   }
   appendEvent_(events, update, message, 'command', command.query, '');
   return results.length ? 'search-results' : 'search-empty';
@@ -291,123 +324,49 @@ function processSearchCommand_(update, message, config, command, outputGroupSear
 
 function processPhoto_(update, message, records, events, config) {
   const recordId = makeRecordId_(message);
-  const existingRow = findRecordRow_(records, recordId);
-  let existingValues = null;
-  if (existingRow) {
-    existingValues = records.getRange(
-      existingRow, 1, 1, RECORD_HEADERS.length
-    ).getValues()[0];
-    const existingStatus = String(existingValues[RECORD_FIELD.ARCHIVE_STATUS] || '');
-    if (existingStatus === 'ARCHIVED') {
-      try {
-        assertDriveArchiveRow_(existingValues);
-      } catch (error) {
-        existingValues[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVE_CONFLICT';
-        existingValues[RECORD_FIELD.ARCHIVE_ERROR] = sheetText_(safeArchiveError_(error));
-        records.getRange(existingRow, 1, 1, RECORD_HEADERS.length)
-          .setValues([existingValues]);
-        appendEvent_(events, update, message, 'photo', firstLine_(message.caption), recordId);
-        throw error;
-      }
-      appendEvent_(events, update, message, 'photo', firstLine_(message.caption), recordId);
-      return 'duplicate-record';
-    }
-    if (['ARCHIVE_RETRY', 'ARCHIVE_FAILED'].indexOf(existingStatus) === -1) {
-      appendEvent_(events, update, message, 'photo', firstLine_(message.caption), recordId);
-      if (['ARCHIVE_FAILED_TERMINAL', 'ARCHIVE_CONFLICT'].indexOf(existingStatus) !== -1) {
-        throw new Error('Canonical archive is in terminal state: ' + existingStatus);
-      }
-      return 'duplicate-record';
-    }
-    if (existingStatus === 'ARCHIVE_RETRY') {
-      const deadline = existingValues[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC];
-      const retryAt = typeof deadline === 'string' ? Date.parse(deadline) : NaN;
-      if (!Number.isFinite(retryAt) || new Date(retryAt).toISOString() !== deadline ||
-          retryAt > Date.now()) {
-        throw new Error('Canonical archive retry is not due or its deadline is invalid.');
-      }
-    }
+  if (findRecordRow_(records, recordId)) {
+    appendEvent_(events, update, message, 'photo', '', recordId);
+    return 'duplicate-record';
   }
-
-  const userId = getUserId_(message);
-  const beforeRow = findEventRow_(
-    events, String(message.chat.id), message.message_id - 1, userId, 'text'
-  );
-  const beforeLine = beforeRow ? String(events.getRange(beforeRow, 6).getValue()) : '';
-  const afterLine = firstLine_(message.caption);
-  const safeAfterLine = sheetText_(afterLine);
+  const row = new Array(RECORD_HEADERS.length).fill('');
   const photo = largestPhoto_(message.photo);
   const sentAt = new Date(message.date * 1000);
-  const uploadTimeUtc = Utilities.formatDate(sentAt, 'UTC', "yyyy-MM-dd'T'HH:mm:ss'Z'");
-  const row = existingRow
-    ? existingValues
-    : new Array(RECORD_HEADERS.length).fill('');
-  row[0] = recordId;
-  row[1] = String(message.chat.id);
-  row[2] = String(update.update_id);
-  row[3] = uploadTimeUtc;
+  row[0] = recordId; row[1] = String(message.chat.id); row[2] = String(update.update_id);
+  row[3] = sentAt.toISOString();
   row[4] = Utilities.formatDate(sentAt, 'Africa/Cairo', 'yyyy-MM-dd HH:mm:ss');
   row[5] = sheetText_(message.from && message.from.username || '');
-  row[6] = sheetText_(displayName_(message.from));
-  row[7] = userId;
-  row[8] = String(message.message_id);
-  row[9] = beforeLine;
-  row[10] = safeAfterLine;
-  row[11] = photo.file_id;
-  row[12] = photo.file_unique_id;
-  row[15] = message.media_group_id || '';
-  const archiveAttempts = Number(row[RECORD_FIELD.ARCHIVE_ATTEMPTS] || 0) + 1;
-  row[RECORD_FIELD.ARCHIVE_ATTEMPTS] = archiveAttempts;
-  let stored;
+  row[6] = sheetText_(displayName_(message.from)); row[7] = getUserId_(message);
+  row[8] = String(message.message_id); row[11] = photo.file_id;
+  row[12] = photo.file_unique_id; row[15] = message.media_group_id || '';
+  const before = findEventRow_(events, row[1], message.message_id - 1, row[7], 'text');
+  row[9] = before ? String(events.getRange(before, 6).getValue()) : '';
+  row[10] = sheetText_(String(message.caption || ''));
+  row[RECORD_FIELD.ORIGINAL_CAPTION] = row[10];
+  row[RECORD_FIELD.LATEST_CAPTION] = row[10];
+  row[RECORD_FIELD.CAPTION_VERSION] = captionVersion_(message, update);
+  row[RECORD_FIELD.ADMITTED_GROUP_ID] = row[1];
+  row[RECORD_FIELD.ADMITTED_AT_UTC] = new Date().toISOString();
+  row[RECORD_FIELD.INTAKE_JSON] = JSON.stringify({ date: message.date, message_id: message.message_id,
+    chat: { id: row[1] }, photo: [photo] });
+  row[16] = 'ARCHIVE_PENDING'; row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVE_PENDING';
+  row[RECORD_FIELD.ARCHIVE_ATTEMPTS] = 0;
+  const analysisActivation = groqActivationState_(config);
+  if (groqRowIsInsideActivationScope_(['', '', '', row[3]], analysisActivation)) {
+    row[RECORD_FIELD.ANALYSIS_ADMITTED_AT_UTC] = row[RECORD_FIELD.ADMITTED_AT_UTC];
+  }
+  // Publication authorization is frozen at receipt, independently of archive completion.
   try {
-    stored = storePhoto_(photo, message, recordId, config);
-  } catch (error) {
-    const disposition = archiveFailureDisposition_(error, archiveAttempts);
-    row[16] = disposition.status;
-    row[17] = sheetText_(safeArchiveError_(error));
-    row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_NOT_ELIGIBLE';
-    row[RECORD_FIELD.PUBLISH_ERROR] = 'Canonical archive was not completed.';
-    row[RECORD_FIELD.ARCHIVE_STATUS] = disposition.status;
-    row[RECORD_FIELD.ARCHIVE_ERROR] = sheetText_(safeArchiveError_(error));
-    row[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC] = '';
-    row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC] = disposition.nextAttempt;
-    if (existingRow) {
-      records.getRange(existingRow, 1, 1, RECORD_HEADERS.length).setValues([row]);
-    } else {
-      records.appendRow(row);
-    }
-    if (disposition.terminal) {
-      appendEvent_(events, update, message, 'photo', safeAfterLine, recordId);
-    }
-    throw new Error(safeArchiveError_(error));
-  }
-  row[13] = stored.id;
-  row[14] = stored.url;
-  row[RECORD_FIELD.ARCHIVE_MIME_TYPE] = stored.mimeType;
-  row[RECORD_FIELD.ARCHIVE_BYTE_SIZE] = stored.byteSize;
-  row[RECORD_FIELD.ARCHIVE_SHA256] = stored.sha256;
-  row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVED';
-  row[RECORD_FIELD.ARCHIVE_ERROR] = '';
-  row[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC] = stored.completedAtUtc;
-  row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC] = '';
-  row[16] = tagStatusForCapture_(config, uploadTimeUtc, row);
-  row[17] = '';
-  const publishEligibility = publicationEligibilityForCapture_(
-    config, stored.completedAtUtc, uploadTimeUtc, row
-  );
-  row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] = publishEligibility.eligibleAt;
-  row[RECORD_FIELD.PUBLISH_STATUS] = publishEligibility.status;
-  row[RECORD_FIELD.OUTPUT_CHAT_ID] = publishEligibility.outputChatId;
-  row[RECORD_FIELD.PUBLISH_ERROR] = sheetText_(publishEligibility.error);
-  if (existingRow) {
-    records.getRange(existingRow, 1, 1, RECORD_HEADERS.length).setValues([row]);
-  } else {
-    records.appendRow(row);
-  }
-
-  if (beforeRow) events.getRange(beforeRow, 7).setValue(recordId);
-  appendEvent_(events, update, message, 'photo', safeAfterLine, recordId);
-  return existingRow ? 'archive-recovered' : 'saved';
+    const groups = parseOutputGroupConfig_(config);
+    const activation = requireNewPhotoOnlyGroqActivation_(config);
+    if (!groqRowIsInsideActivationScope_(row, activation)) throw new Error('Outside capture cutoff.');
+    row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] = row[RECORD_FIELD.ADMITTED_AT_UTC];
+    row[RECORD_FIELD.OUTPUT_CHAT_ID] = groups.outputChatId;
+    row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_WAITING_FOR_ENRICHMENT';
+  } catch (ignored) { row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_NOT_ELIGIBLE'; }
+  applyPendingCaptionEdits_(row, events);
+  records.appendRow(row); // Must succeed before Events or Telegram acknowledgement.
+  appendEvent_(events, update, message, 'photo', '', recordId);
+  return 'saved';
 }
 
 function processText_(update, message, records, events) {
@@ -419,9 +378,13 @@ function processText_(update, message, records, events) {
 
   if (row) {
     const sameUser = String(records.getRange(row, 8).getValue()) === getUserId_(message);
-    const afterIsEmpty = !records.getRange(row, 11).getValue();
+    const afterIsEmpty = !records.getRange(row, RECORD_FIELD.ADJACENT_AFTER_TEXT + 1).getValue();
     if (sameUser && afterIsEmpty) {
-      records.getRange(row, 11).setValue(text);
+      records.getRange(row, RECORD_FIELD.ADJACENT_AFTER_TEXT + 1).setValue(text);
+      records.getRange(row, RECORD_FIELD.CAPTION_SYNC_STATUS + 1).setValue('SYNC_PENDING');
+      records.getRange(row, RECORD_FIELD.CAPTION_SYNC_ATTEMPTS + 1).setValue(0);
+      records.getRange(row, RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC + 1).setValue('');
+      records.getRange(row, RECORD_FIELD.CAPTION_SYNC_ERROR + 1).setValue('');
       associatedRecordId = previousRecordId;
     }
   }
@@ -548,7 +511,8 @@ function archiveFailureDisposition_(error, attempts) {
     status: terminal ? 'ARCHIVE_FAILED_TERMINAL' : 'ARCHIVE_RETRY',
     terminal: terminal,
     nextAttempt: terminal ? '' : new Date(
-      Date.now() + Math.min(60, Math.pow(2, Math.max(1, count))) * 60000
+      Date.now() + Math.max(Math.min(40, 5 * Math.pow(2, Math.max(0, count - 1))) * 60000,
+      Number(error && error.retryAfterSeconds || 0) * 1000)
     ).toISOString()
   };
 }
@@ -583,7 +547,7 @@ function safeOperationalError_(error, fallback) {
 }
 
 function telegram_(method, payload, token) {
-  const response = fetchOk_('https://api.telegram.org/bot' + token + '/' + method, {
+  const response = fetchProvider_('https://api.telegram.org/bot' + token + '/' + method, {
     method: 'post',
     payload: payload,
     muteHttpExceptions: true
@@ -592,9 +556,19 @@ function telegram_(method, payload, token) {
   try {
     body = JSON.parse(response.getContentText());
   } catch (error) {
-    throw new Error('Telegram ' + method + ' returned invalid response JSON.');
+    const invalid = new Error('Telegram ' + method + ' returned invalid response JSON.');
+    invalid.httpStatus = response.getResponseCode();
+    invalid.retryAfterSeconds = providerRetryAfterSeconds_(response);
+    throw invalid;
   }
-  if (!body.ok) throw new Error('Telegram ' + method + ' failed.');
+  if (!body.ok) {
+    if (method === 'editMessageCaption' && Number(body.error_code) === 400 &&
+        /^Bad Request: message is not modified/i.test(String(body.description || ''))) return { ok: true };
+    const error = new Error('Telegram request failed.');
+    error.httpStatus = Number(body.error_code || 0);
+    error.retryAfterSeconds = Math.max(providerRetryAfterSeconds_(response), Number(body.parameters && body.parameters.retry_after || 0));
+    throw error;
+  }
   return body;
 }
 
@@ -602,7 +576,14 @@ function fetchOk_(url, options) {
   const response = fetchProvider_(url, options || { muteHttpExceptions: true });
   const status = response.getResponseCode();
   if (status < 200 || status >= 300) {
-    throw new Error('HTTP ' + status + ': provider request failed.');
+    const failure = new Error('HTTP ' + status + ': provider request failed.');
+    failure.httpStatus = status;
+    try {
+      const headers = response.getHeaders();
+      const retry = headers['Retry-After'] || headers['retry-after'];
+      failure.retryAfterSeconds = Number(retry) || Math.max(0, (Date.parse(retry) - Date.now()) / 1000) || 0;
+    } catch (ignored) {}
+    throw failure;
   }
   return response;
 }
@@ -619,10 +600,11 @@ function fetchProvider_(url, options) {
 function installWebhook() {
   const config = getConfig_(true);
   if (!config.webAppUrl) throw new Error('Run bootstrapPoc() after deploying the web app.');
-  verifyConfiguredInputBotAdmin_(config);
+  if (sharedCatalogEnabled_()) verifyCurrentBotMemberships_(config, parseOutputGroupIds_(config));
+  else verifyConfiguredInputBotAdmin_(config);
   return telegram_('setWebhook', {
     url: webhookUrl_(config.webAppUrl, config.webhookSecret),
-    allowed_updates: JSON.stringify(['message']),
+    allowed_updates: JSON.stringify(['message', 'edited_message', 'my_chat_member']),
     max_connections: 1,
     drop_pending_updates: false
   }, config.botToken);
@@ -890,7 +872,8 @@ function outputGroupVerificationMarker_(groups, tokenFingerprint) {
 
 function requireVerifiedOutputGroups_(config) {
   const groups = parseOutputGroupIds_(config);
-  const expected = outputGroupVerificationMarker_(groups, config.botTokenFingerprint);
+  const expected = sharedCatalogEnabled_() ? sharedOutputMarker_(config) :
+    outputGroupVerificationMarker_(groups, config.botTokenFingerprint);
   if (String(config.outputGroupsVerifiedFor || '') !== expected) {
     throw new Error(
       'Input/output groups have not been verified for these exact IDs and current bot token.'
@@ -949,7 +932,8 @@ function verifyOutputGroups() {
     if (finalSheet && recordsHavePublishingClaims_(finalSheet)) {
       throw new Error('A publication claim started during verification; run it again.');
     }
-    marker = outputGroupVerificationMarker_(groups, config.botTokenFingerprint);
+    marker = sharedCatalogEnabled_() ? sharedOutputMarker_(config) :
+      outputGroupVerificationMarker_(groups, config.botTokenFingerprint);
     properties.setProperty(OUTPUT_GROUP_VERIFICATION_PROPERTY, marker);
   } finally {
     finalLock.releaseLock();
@@ -962,8 +946,8 @@ function verifyOutputGroups() {
       display_name: String(me.first_name || '')
     },
     input_group: verifiedChats[0],
-    output_group: verifiedChats[1],
-    verification_version: 'v2'
+    output_group: verifiedChats[verifiedChats.length - 1],
+    verification_version: sharedCatalogEnabled_() ? 'v3' : 'v2'
   };
 }
 
@@ -972,7 +956,8 @@ function verifyCurrentBotMemberships_(config, groups) {
   if (!me || me.is_bot !== true || !/^[1-9]\d*$/.test(String(me.id || ''))) {
     throw new Error('Telegram getMe did not return a valid bot identity.');
   }
-  const chats = [groups.inputChatId, groups.outputChatId].map(function (chatId) {
+  const ids = sharedCatalogEnabled_() ? [groups.outputChatId] : [groups.inputChatId, groups.outputChatId];
+  const chats = ids.map(function (chatId) {
     const chat = telegram_('getChat', { chat_id: chatId }, config.botToken).result;
     const membership = telegram_('getChatMember', {
       chat_id: chatId,
@@ -1031,7 +1016,7 @@ function telegramMembershipAllowsSearch_(membership) {
 function isCurrentSearchGroupMember_(userId, config, chatId) {
   try {
     const membership = telegram_('getChatMember', {
-      chat_id: chatId || config.allowedChatId,
+      chat_id: chatId || config.outputChatId,
       user_id: String(userId)
     }, config.botToken).result;
     return telegramMembershipAllowsSearch_(membership) &&
@@ -1629,9 +1614,17 @@ function geminiEmbedPart_(part, config) {
     }
   );
   const status = response.getResponseCode();
+  const responseText = response.getContentText();
   if (status < 200 || status >= 300) {
     const error = new Error('Gemini HTTP ' + status + ': request failed.');
     error.httpStatus = status;
+    error.retryAfterSeconds = providerRetryAfterSeconds_(response);
+    try {
+      const details = JSON.parse(responseText);
+      error.retryAfterSeconds = Math.max(error.retryAfterSeconds, Number(details.parameters && details.parameters.retry_after || 0));
+      error.stageConfiguration = /model_not_found|invalid_api_key|authentication|permission|insufficient_quota/.test(
+        String(details.error && (details.error.code || details.error.type) || ''));
+    } catch (ignored) {}
     throw error;
   }
   let body;
@@ -1802,6 +1795,9 @@ function enableGroqTaggingForNewPhotosOnly() {
 }
 
 function activateGroqMode_(requestedMode) {
+  if (sharedCatalogEnabled_() && requestedMode !== GROQ_TAGGING_MODE_NEW_PHOTOS_ONLY) {
+    throw new Error('Historical backfill is disabled for the shared catalog.');
+  }
   if ([GROQ_TAGGING_MODE_NEW_PHOTOS_ONLY, GROQ_TAGGING_MODE_LEGACY_BACKFILL]
       .indexOf(requestedMode) === -1) {
     throw new Error('Unknown Groq activation mode.');
@@ -1824,7 +1820,11 @@ function activateGroqMode_(requestedMode) {
     if (recordsHavePublishingClaims_(sheet)) {
       throw new Error('A publication claim is still in flight. Wait for it to finish before activation.');
     }
-    if (requestedMode === GROQ_TAGGING_MODE_NEW_PHOTOS_ONLY) {
+    const cutoffNow = new Date(Math.ceil(Date.now() / 1000) * 1000).toISOString();
+    const plan = planGroqActivation_(requestedMode, values, cutoffNow);
+    const cutoff = plan.cutoff;
+    const sharedResumption = values.SHARED_CATALOG_VERSION === '3' && plan.resumed;
+    if (requestedMode === GROQ_TAGGING_MODE_NEW_PHOTOS_ONLY && !sharedResumption) {
       const webhookInfo = telegram_('getWebhookInfo', {}, String(values.BOT_TOKEN || '')).result;
       if (!webhookInfo || Number(webhookInfo.pending_update_count || 0) !== 0) {
         throw new Error(
@@ -1832,10 +1832,6 @@ function activateGroqMode_(requestedMode) {
         );
       }
     }
-
-    const cutoffNow = new Date(Math.ceil(Date.now() / 1000) * 1000).toISOString();
-    const plan = planGroqActivation_(requestedMode, values, cutoffNow);
-    const cutoff = plan.cutoff;
 
     try {
       closeManagedWorkerFailClosed_(GROQ_TAGGING_ENABLED_PROPERTY, 'processPendingTags');
@@ -1934,7 +1930,8 @@ function planGroqActivation_(requestedMode, values, nowIso) {
     throw new Error('Groq is enabled in a different or invalid mode. Disable it first.');
   }
   if (requestedMode === GROQ_TAGGING_MODE_NEW_PHOTOS_ONLY &&
-      alreadyEnabled && existingMode === requestedMode && existingCutoff) {
+      (alreadyEnabled || values.SHARED_CATALOG_VERSION === '3') &&
+      existingMode === requestedMode && existingCutoff) {
     return { cutoff: existingCutoff, resumed: true };
   }
   const newCutoff = requestedMode === GROQ_TAGGING_MODE_NEW_PHOTOS_ONLY
@@ -1985,6 +1982,7 @@ function groqActivationState_(config) {
 
 function groqRowIsInsideActivationScope_(row, activation) {
   if (!activation || !activation.valid) return false;
+  if (row[RECORD_FIELD.ADMITTED_GROUP_ID]) return Boolean(row[RECORD_FIELD.ANALYSIS_ADMITTED_AT_UTC]);
   if (activation.mode === GROQ_TAGGING_MODE_LEGACY_BACKFILL) return true;
   const sentAt = new Date(String(row[3] || ''));
   const cutoff = new Date(activation.cutoff);
@@ -2010,6 +2008,7 @@ function disableGroqTagging() {
 }
 
 function queueExistingPhotosForTagging() {
+  if (sharedCatalogEnabled_()) throw new Error('Historical backfill is disabled for the shared catalog.');
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) throw new Error('Could not lock Records for tag queueing.');
   try {
@@ -2050,6 +2049,7 @@ function queueExistingPhotosForTagging() {
 
 function processPendingTags(event) {
   const config = getConfig_(false);
+  if (stageIsPaused_('analysis')) return { processed: 0, paused: true };
   if (!config.groqTaggingEnabled) {
     return { processed: 0, skipped: 'Groq tagging is disabled' };
   }
@@ -2066,6 +2066,7 @@ function processPendingTags(event) {
   let failed = 0;
   claims.forEach(function (claim) {
     const claimConfig = claim.config;
+    if (stageIsPaused_('analysis')) { releasePausedTagClaim_(claimConfig, claim); return; }
     try {
       revalidateTagClaim_(claimConfig, claim);
       const tags = groqTagDriveImage_(claim.driveFileId, claimConfig, claim);
@@ -2079,6 +2080,7 @@ function processPendingTags(event) {
       });
       if (saved) tagged++;
     } catch (error) {
+      if (pauseStageForError_('analysis', error)) { releasePausedTagClaim_(claimConfig, claim); return; }
       const retry = shouldRetryGroqError_(error, claim.attempts);
       const saved = finishTagClaim_(claimConfig, claim, {
         status: retry ? 'TAG_RETRY' : 'TAG_ERROR',
@@ -2087,7 +2089,7 @@ function processPendingTags(event) {
         metadataJson: '',
         error: safeTagError_(error),
         nextAttempt: retry
-          ? new Date(Date.now() + groqBackoffMinutes_(claim.attempts) * 60000)
+          ? new Date(Date.now() + Math.max(groqBackoffMinutes_(claim.attempts) * 60000, Number(error.retryAfterSeconds || 0) * 1000))
           : ''
       });
       if (saved && retry) retrying++;
@@ -2111,6 +2113,7 @@ function triggerInvocationIsCurrent_(event, expectedTriggerUid) {
 }
 
 function processPendingPublications() {
+  if (stageIsPaused_('publication')) return { processed: 0, paused: true };
   const config = getConfig_(true);
   const groups = parseOutputGroupConfig_(config);
   const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
@@ -2119,6 +2122,10 @@ function processPendingPublications() {
   const outcome = { processed: 0, published: 0, retrying: 0, failed: 0, unknown: 0 };
   claims.forEach(function (claim) {
     let result;
+    if (stageIsPaused_('publication')) {
+      finishPublishClaim_(sheet, claim, { status: 'PUBLISH_RETRY', nextAttempt: '', error: 'Stage paused; operator recovery required.' });
+      refundPublicationAttempt_(sheet, claim); return;
+    }
     try {
       const live = revalidatePublishClaim_(sheet, claim, groups);
       result = telegramPublishPhoto_(claim, live.config.botToken, live.archiveBlob);
@@ -2132,6 +2139,10 @@ function processPendingPublications() {
         outcome.published++;
       }
     } catch (error) {
+      if (pauseStageForError_('publication', error)) {
+        finishPublishClaim_(sheet, claim, { status: 'PUBLISH_RETRY', nextAttempt: '', error: 'Stage paused; operator recovery required.' });
+        refundPublicationAttempt_(sheet, claim); return;
+      }
       const disposition = publishErrorDisposition_(error, claim.attempts);
       if (finishPublishClaim_(sheet, claim, disposition)) {
         outcome.processed++;
@@ -2201,11 +2212,7 @@ function claimPendingPublications_(sheet, groups, limit) {
         sheet.getRange(index + 2, 1, 1, RECORD_HEADERS.length).setValues([row]);
         return;
       }
-      const caption = buildPublishCaption_(
-        row[RECORD_FIELD.AI_METADATA_JSON],
-        [readSheetText_(row[18]), readSheetText_(row[9]), readSheetText_(row[10])]
-          .filter(Boolean).join(' · ')
-      );
+      const caption = recordPublishCaption_(row);
       const claimId = Utilities.getUuid();
       const claimedAttempts = attempts + 1;
       row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISHING';
@@ -2259,13 +2266,14 @@ function isClaimablePublicationRow_(row, groups, now) {
 
 function publicationRowBoundaryError_(row, groups) {
   if (!archiveRowIsReady_(row) || !row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] ||
-      String(row[1]) !== groups.inputChatId ||
+      !(String(row[RECORD_FIELD.ADMITTED_GROUP_ID] || '') === String(row[1]) ||
+        String(row[1]) === groups.inputChatId) ||
       String(row[RECORD_FIELD.OUTPUT_CHAT_ID]) !== groups.outputChatId ||
       row[RECORD_FIELD.OUTPUT_MESSAGE_ID] ||
-      String(row[16]) !== 'TAGGED' || !row[11]) {
+      ['TAGGED', 'TAG_UNAVAILABLE'].indexOf(String(row[16])) === -1 || !row[11]) {
     return 'Publication candidate no longer satisfies the captured eligibility boundary.';
   }
-  if (!parseStoredMetadata_(row[RECORD_FIELD.AI_METADATA_JSON])) {
+  if (String(row[16]) !== 'TAG_UNAVAILABLE' && !parseStoredMetadata_(row[RECORD_FIELD.AI_METADATA_JSON])) {
     return 'Stored AI metadata JSON is invalid.';
   }
   return '';
@@ -2297,7 +2305,6 @@ function revalidatePublishClaim_(sheet, claim, expectedGroups) {
     }
     if (liveGroups.inputChatId !== expectedGroups.inputChatId ||
         liveGroups.outputChatId !== expectedGroups.outputChatId ||
-        liveGroups.inputChatId !== claim.inputChatId ||
         liveGroups.outputChatId !== claim.outputChatId) {
       const configChangedError = new Error(
         'Output group configuration changed after publication claim.'
@@ -2325,7 +2332,7 @@ function publishClaimMatchesRow_(row, claim, now) {
   return archiveEvidenceMatchesRow_(claim, row) && String(row[0]) === claim.recordId &&
     String(row[1]) === claim.inputChatId &&
     String(row[11]) === claim.fileId &&
-    String(row[16]) === claim.tagState && claim.tagState === 'TAGGED' &&
+    String(row[16]) === claim.tagState && ['TAGGED', 'TAG_UNAVAILABLE'].indexOf(claim.tagState) !== -1 &&
     String(row[RECORD_FIELD.AI_METADATA_JSON]) === claim.metadataJson &&
     String(row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC]) === claim.eligibleAt &&
     String(row[RECORD_FIELD.PUBLISH_STATUS]) === 'PUBLISHING' &&
@@ -2391,6 +2398,7 @@ function classifyTelegramPublishResponse_(status, responseText) {
   const error = new Error(
     'Telegram publication failed (HTTP ' + status + ').'
   );
+  error.httpStatus = code;
   if (explicitRejection && (code === 429 || code >= 500)) {
     error.publishDisposition = 'RETRY';
     error.retryAfterSeconds = boundedRetryAfterSeconds_(
@@ -2406,6 +2414,7 @@ function classifyTelegramPublishResponse_(status, responseText) {
 
 function invalidTelegramPublishResponse_(status) {
   const invalidError = new Error('Telegram returned an unreadable publication response.');
+  invalidError.httpStatus = status >= 400 && status < 500 ? status : 0;
   invalidError.publishDisposition = status >= 400 && status < 500 && status !== 429
     ? 'FAILED'
     : 'UNKNOWN';
@@ -2415,16 +2424,14 @@ function invalidTelegramPublishResponse_(status) {
 function boundedRetryAfterSeconds_(value) {
   const seconds = Number(value);
   if (!isFinite(seconds)) return 0;
-  return Math.max(0, Math.min(3600, Math.floor(seconds)));
+  return Math.max(0, Math.floor(seconds));
 }
 
 function publishErrorDisposition_(error, attempts) {
   const disposition = String(error && error.publishDisposition || 'UNKNOWN');
   if (disposition === 'RETRY' && attempts < PUBLISH_MAX_ATTEMPTS) {
     const retrySeconds = boundedRetryAfterSeconds_(error && error.retryAfterSeconds);
-    const delayMs = retrySeconds > 0
-      ? retrySeconds * 1000
-      : publishBackoffMinutes_(attempts) * 60000;
+    const delayMs = Math.max(retrySeconds * 1000, publishBackoffMinutes_(attempts) * 60000);
     return {
       status: 'PUBLISH_RETRY',
       messageId: '',
@@ -2441,7 +2448,7 @@ function publishErrorDisposition_(error, attempts) {
 }
 
 function publishBackoffMinutes_(attempts) {
-  return Math.min(60, Math.pow(2, Math.max(1, Number(attempts) || 1)));
+  return Math.min(40, 5 * Math.pow(2, Math.max(0, (Number(attempts) || 1) - 1)));
 }
 
 function finishPublishClaim_(sheet, claim, result) {
@@ -2509,6 +2516,8 @@ function claimPendingTags_(config, limit) {
       ) continue;
 
       const claimedAttempts = attempts + 1;
+      const tagClaimId = Utilities.getUuid();
+      sheet.getRange(index + 2, RECORD_FIELD.TAG_CLAIM_ID + 1).setValue(tagClaimId);
       const leaseUntil = new Date(now.getTime() + GROQ_LEASE_MINUTES * 60000);
       sheet.getRange(index + 2, 17, 1, 8).setValues([[
         'TAGGING',
@@ -2528,6 +2537,8 @@ function claimPendingTags_(config, limit) {
         archiveSha256: String(row[RECORD_FIELD.ARCHIVE_SHA256]),
         archiveCompletedAtUtc: String(row[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC]),
         attempts: claimedAttempts,
+        claimId: tagClaimId,
+        leaseUntilUtc: leaseUntil.toISOString(),
         // This in-memory snapshot binds the provider call and audit write to the
         // same configuration that was current while the row was claimed.
         config: currentConfig
@@ -2541,12 +2552,12 @@ function claimPendingTags_(config, limit) {
 
 function applyTerminalTagError_(row, errorText) {
   const safeError = safeTagError_(errorText);
-  row[16] = 'TAG_ERROR';
+  row[16] = 'TAG_UNAVAILABLE';
   row[17] = sheetText_(safeError);
   row[22] = '';
   if (String(row[RECORD_FIELD.PUBLISH_STATUS]) === 'PUBLISH_WAITING_FOR_ENRICHMENT' &&
       row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC]) {
-    row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_BLOCKED_ENRICHMENT';
+    row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_PENDING';
     row[RECORD_FIELD.PUBLISH_ERROR] = sheetText_(safeError);
   }
   return row;
@@ -2561,6 +2572,8 @@ function revalidateTagClaim_(config, claim) {
     if (!rowNumber) throw new Error('Claimed record no longer exists.');
     const row = sheet.getRange(rowNumber, 1, 1, RECORD_HEADERS.length).getValues()[0];
     if (String(row[16]) !== 'TAGGING' || Number(row[21]) !== claim.attempts ||
+        (claim.claimId && (row[RECORD_FIELD.TAG_CLAIM_ID] !== claim.claimId ||
+          new Date(row[22]).getTime() <= Date.now())) ||
         !archiveEvidenceMatchesRow_(claim, row)) {
       throw new Error('Groq claim or canonical archive changed before analysis.');
     }
@@ -2581,10 +2594,13 @@ function finishTagClaim_(config, claim, result) {
       rowNumber, 1, 1, RECORD_HEADERS.length
     ).getValues()[0];
     if (!archiveEvidenceMatchesRow_(claim, current) ||
-        String(current[16]) !== 'TAGGING' || Number(current[21]) !== claim.attempts) {
+        String(current[16]) !== 'TAGGING' || Number(current[21]) !== claim.attempts ||
+        (claim.claimId && (current[RECORD_FIELD.TAG_CLAIM_ID] !== claim.claimId ||
+          new Date(current[22]).getTime() <= Date.now()))) {
       return false;
     }
-    current[16] = result.status;
+    current[RECORD_FIELD.TAG_CLAIM_ID] = '';
+    current[16] = result.status === 'TAG_ERROR' ? 'TAG_UNAVAILABLE' : result.status;
     current[17] = sheetText_(result.error);
     current[19] = sheetText_(result.aiTags);
     current[20] = sheetText_(result.aiCaption);
@@ -2604,8 +2620,12 @@ function finishTagClaim_(config, claim, result) {
       current[RECORD_FIELD.PUBLISH_ERROR] = '';
     } else if (result.status === 'TAG_ERROR' &&
         String(current[RECORD_FIELD.PUBLISH_STATUS]) === 'PUBLISH_WAITING_FOR_ENRICHMENT') {
-      current[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_BLOCKED_ENRICHMENT';
+      current[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_PENDING';
       current[RECORD_FIELD.PUBLISH_ERROR] = sheetText_(result.error);
+    }
+    if (result.status === 'TAGGED' && current[RECORD_FIELD.OUTPUT_MESSAGE_ID]) {
+      current[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+      current[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
     }
     sheet.getRange(rowNumber, 1, 1, RECORD_HEADERS.length).setValues([current]);
     return true;
@@ -2678,6 +2698,13 @@ function groqTagDriveImage_(driveFileId, config, archiveEvidence) {
   if (status < 200 || status >= 300) {
     const error = new Error('Groq HTTP ' + status + ': ' + groqErrorMessage_(responseText));
     error.httpStatus = status;
+    error.retryAfterSeconds = providerRetryAfterSeconds_(response);
+    try {
+      const details = JSON.parse(responseText);
+      error.retryAfterSeconds = Math.max(error.retryAfterSeconds, Number(details.parameters && details.parameters.retry_after || 0));
+      error.stageConfiguration = /model_not_found|invalid_api_key|authentication|permission|insufficient_quota/.test(
+        String(details.error && (details.error.code || details.error.type) || ''));
+    } catch (ignored) {}
     throw error;
   }
   let body;
@@ -2917,6 +2944,7 @@ function buildPublishCaption_(metadataJson, humanContext) {
   const metadata = parseStoredMetadata_(metadataJson);
   if (!metadata) throw new Error('Stored AI metadata JSON is invalid.');
   const sections = [
+    ['Context', captionTokens_(humanContext), ' ', 140],
     ['EN', captionTokens_(metadata.caption_en), ' ', 240],
     ['AR', captionTokens_(metadata.caption_ar), ' ', 240],
     ['Words', [].concat(metadata.tags_en, metadata.objects_en, metadata.topics_en), ', ', 180],
@@ -2925,8 +2953,7 @@ function buildPublishCaption_(metadataJson, humanContext) {
     ['Activity', [].concat(metadata.activities_en, metadata.settings_en), ', ', 120],
     ['النشاط', [].concat(metadata.activities_ar, metadata.settings_ar), '، ', 120],
     ['Colors', [].concat(metadata.colors_en, metadata.visual_tone_en), ', ', 100],
-    ['الألوان', [].concat(metadata.colors_ar, metadata.visual_tone_ar), '، ', 100],
-    ['Context', captionTokens_(humanContext), ' ', 140]
+    ['الألوان', [].concat(metadata.colors_ar, metadata.visual_tone_ar), '، ', 100]
   ];
   const lines = [];
   sections.some(function (section) {
@@ -3004,7 +3031,7 @@ function shouldRetryGroqError_(error, attempts) {
 }
 
 function groqBackoffMinutes_(attempts) {
-  return Math.min(60, Math.pow(2, Math.max(1, Number(attempts) || 1)));
+  return Math.min(40, 5 * Math.pow(2, Math.max(0, (Number(attempts) || 1) - 1)));
 }
 
 function safeTagError_(error) {
@@ -3175,12 +3202,12 @@ function normalizeSearchText_(value) {
 
 function rankRecordValues_(values, query, limit, allowLegacyUnverified) {
   const normalizedQuery = normalizeSearchText_(query);
-  const tokens = Array.from(new Set(normalizedQuery.split(' ').filter(Boolean)));
+  const tokens = meaningfulQueryTokens_(query);
   if (!tokens.length) return [];
 
   return values.map(function (row) {
     if (!recordSearchIsAllowed_(row, allowLegacyUnverified)) return null;
-    const context = [row[9], row[10]].map(readSheetText_).filter(Boolean).join(' · ');
+    const context = [row[9], row[10], row[RECORD_FIELD.ADJACENT_AFTER_TEXT]].map(readSheetText_).filter(Boolean).join(' · ');
     const manualTags = readSheetText_(row[18]);
     const aiTags = readSheetText_(row[19]);
     const aiCaption = readSheetText_(row[20]);
@@ -3228,8 +3255,8 @@ function rankRecordValues_(values, query, limit, allowLegacyUnverified) {
         phraseBonus
     };
   }).filter(Boolean).sort(function (left, right) {
-    return right.score - left.score ||
-      right.matchedTerms - left.matchedTerms ||
+    return right.matchedTerms - left.matchedTerms ||
+      right.score - left.score ||
       left.recordId.localeCompare(right.recordId);
   }).slice(0, limit);
 }
@@ -3498,8 +3525,7 @@ function searchPublishedGroupRecords_(sheet, query, limit, config) {
   if (sheet.getLastRow() < 2) return [];
   const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length)
     .getValues().filter(function (row) {
-      return String(row[1]) === config.allowedChatId &&
-        String(row[RECORD_FIELD.PUBLISH_STATUS]) === 'PUBLISHED' &&
+      return String(row[RECORD_FIELD.PUBLISH_STATUS]) === 'PUBLISHED' &&
         String(row[RECORD_FIELD.OUTPUT_CHAT_ID]) === config.outputChatId &&
         /^[1-9]\d*$/.test(String(row[RECORD_FIELD.OUTPUT_MESSAGE_ID] || ''));
     });
@@ -3852,7 +3878,7 @@ function selfCheck() {
   const tokenLines = [];
   appendCaptionSection_(tokenLines, 'X', ['alpha', 'beta'], ' ', 7);
   if (unicodeCodePointLength_(publishCaption) > 1024 || hasLoneSurrogate_(publishCaption) ||
-      publishCaption.indexOf('EN: ') !== 0 ||
+      publishCaption.indexOf('Context: ') !== 0 || publishCaption.indexOf('\nEN: ') === -1 ||
       publishCaption.indexOf('\nAR: ') === -1 || publishCaption.indexOf('TEAM 2026') === -1 ||
       tokenLines.join('\n') !== 'X: alpha' || unicodeCodePointLength_('😀') !== 1 ||
       buildPublishCaption_(parsedTags.metadataJson, 'context') !==
@@ -4042,8 +4068,8 @@ function selfCheck() {
     !shouldRetryGroqError_({ httpStatus: 503 }, 4) ||
     shouldRetryGroqError_({ httpStatus: 401 }, 1) ||
     shouldRetryGroqError_({ httpStatus: 503 }, GROQ_MAX_ATTEMPTS) ||
-    groqBackoffMinutes_(1) !== 2 ||
-    groqBackoffMinutes_(10) !== 60
+    groqBackoffMinutes_(1) !== 5 ||
+    groqBackoffMinutes_(10) !== 40
   ) {
     throw new Error('Groq retry policy failed');
   }
@@ -4080,8 +4106,8 @@ function selfCheck() {
       isClaimablePublicationRow_(ambiguousPublication, publishGroups, publicationNow) ||
       isClaimablePublicationRow_(unsettledPublication, publishGroups, publicationNow) ||
       !hasPublicationSettled_('2026-08-29T00:59:39Z', publicationNow) ||
-      terminalTagRow[16] !== 'TAG_ERROR' ||
-      terminalTagRow[RECORD_FIELD.PUBLISH_STATUS] !== 'PUBLISH_BLOCKED_ENRICHMENT' ||
+      terminalTagRow[16] !== 'TAG_UNAVAILABLE' ||
+      terminalTagRow[RECORD_FIELD.PUBLISH_STATUS] !== 'PUBLISH_PENDING' ||
       terminalTagRow[RECORD_FIELD.PUBLISH_ERROR] !== 'lease exhausted' ||
       publicationRowBoundaryError_(corruptPublication, publishGroups) !==
         'Stored AI metadata JSON is invalid.' ||
@@ -4200,10 +4226,10 @@ function selfCheck() {
       publishErrorDisposition_(unknownPublish, 1).status !== 'PUBLISH_UNKNOWN' ||
       !invalidSuccessBodies.every(function (error) {
         return error && error.publishDisposition === 'UNKNOWN';
-      }) || !overflowRetry || overflowRetry.retryAfterSeconds !== 3600 ||
+      }) || !overflowRetry || overflowRetry.retryAfterSeconds !== 99999 ||
       boundedRetryAfterSeconds_(-5) !== 0 ||
       boundedRetryAfterSeconds_('1e999') !== 0 ||
-      publishBackoffMinutes_(1) !== 2 || publishBackoffMinutes_(10) !== 60) {
+      publishBackoffMinutes_(1) !== 5 || publishBackoffMinutes_(10) !== 40) {
     throw new Error('Telegram publication response classification failed');
   }
 
@@ -4366,4 +4392,471 @@ function selfCheck() {
   }
   console.log('PASS: Telegram collector self-check');
   return true;
+}
+
+// Shared catalog v3. The original 45 columns retain their positions and bytes.
+const GROUP_HEADERS = ['chat_id', 'initiator_id', 'event_version', 'state', 'bot_status', 'verified_at_utc', 'bot_token_fingerprint', 'enrollment_authority'];
+const SHARED_CATALOG_PROPERTY = 'SHARED_CATALOG_VERSION';
+
+function meaningfulQueryTokens_(query) {
+  const stop = new Set(('the a an and or of in on at to for with from is are this that ' +
+    'من في على الي الى و او عن مع هذا هذه هو هي ال').split(' ').map(normalizeSearchText_));
+  return Array.from(new Set(normalizeSearchText_(query).split(' ').filter(function (word) {
+    return word && !stop.has(word);
+  })));
+}
+
+function sharedOutputMarker_(config) {
+  return 'v3|' + config.outputChatId + '|' + config.botTokenFingerprint;
+}
+
+function sharedCatalogEnabled_() {
+  if (typeof PropertiesService === 'undefined') return false;
+  return PropertiesService.getScriptProperties().getProperty(SHARED_CATALOG_PROPERTY) === '3';
+}
+
+function groupRows_(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName('Groups');
+  return sheet && sheet.getLastRow() > 1
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, GROUP_HEADERS.length).getValues() : [];
+}
+
+function inputGroupIsActive_(spreadsheet, chatId, config) {
+  if (chatId === config.outputChatId || !sharedCatalogEnabled_()) return false;
+  return groupRows_(spreadsheet).some(function (row) {
+    return String(row[0]) === chatId && row[3] === 'ACTIVE' &&
+      row[6] === config.botTokenFingerprint;
+  });
+}
+
+function enrollmentVersion_(update) {
+  const e = update.my_chat_member;
+  return String(Number(e.date || 0)).padStart(12, '0') + ':' +
+    String(Number(update.update_id || 0)).padStart(16, '0');
+}
+
+function processEnrollment_(update, config) {
+  const event = update.my_chat_member;
+  if (!event || !isGroupMessage_({ chat: event.chat }) ||
+      String(event.chat.id) === config.outputChatId || !sharedCatalogEnabled_()) return 'ignored';
+  const me = telegram_('getMe', {}, config.botToken).result;
+  if (!me || me.is_bot !== true || !event.new_chat_member || !event.old_chat_member ||
+      !event.new_chat_member.user || !event.old_chat_member.user ||
+      String(event.new_chat_member.user.id) !== String(me.id) ||
+      String(event.old_chat_member.user.id) !== String(me.id)) return 'ignored';
+  const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+  const sheet = spreadsheet.getSheetByName('Groups');
+  if (!sheet) throw new Error('Run migrateSharedCatalog() first.');
+  const rows = groupRows_(spreadsheet), id = String(event.chat.id);
+  const index = rows.findIndex(function (row) { return String(row[0]) === id; });
+  const prior = index < 0 ? null : rows[index];
+  const version = enrollmentVersion_(update);
+  if (prior && String(prior[2]) >= version) return 'stale';
+  const status = String(event.new_chat_member && event.new_chat_member.status || 'unknown');
+  const oldStatus = String(event.old_chat_member && event.old_chat_member.status || 'unknown');
+  const added = ['left', 'kicked'].indexOf(oldStatus) !== -1;
+  // Preserve the original add actor even when a different administrator promotes the bot.
+  const initiator = prior && !added ? String(prior[1]) :
+    event.from && event.from.is_bot === false && /^[1-9]\d*$/.test(String(event.from.id))
+      ? String(event.from.id) : '';
+  const row = [id, initiator, version,
+    ['administrator', 'creator'].indexOf(status) === -1 ? 'SUSPENDED' : 'PENDING', status, '', config.botTokenFingerprint,
+    prior && !added && trustedMigrationSeed_(prior, config) ? 'MIGRATION_VERIFIED' : 'INITIATOR'];
+  if (['member', 'restricted'].indexOf(status) !== -1 && (!prior || added)) row[3] = 'PENDING';
+  if (row[3] === 'PENDING') verifyEnrollmentRow_(row, config);
+  if (index < 0) sheet.appendRow(row);
+  else sheet.getRange(index + 2, 1, 1, GROUP_HEADERS.length).setValues([row]);
+  return String(row[3]).toLowerCase();
+}
+
+function verifyEnrollmentRow_(row, config) {
+  row[3] = 'PENDING';
+  const trustedSeed = trustedMigrationSeed_(row, config);
+  if (!row[1] && !trustedSeed) { row[3] = 'INACTIVE'; return; }
+  try {
+    requireVerifiedOutputGroups_(config);
+    const me = telegram_('getMe', {}, config.botToken).result;
+    if (!me || me.is_bot !== true || !/^[1-9]\d*$/.test(String(me.id))) return;
+    const inputChat = telegram_('getChat', { chat_id: row[0] }, config.botToken).result;
+    if (!inputChat || String(inputChat.id) !== String(row[0]) ||
+        ['group', 'supergroup'].indexOf(inputChat.type) === -1) return;
+    if (!trustedSeed) {
+    const actor = telegram_('getChatMember', { chat_id: config.outputChatId, user_id: row[1] }, config.botToken).result;
+    const inputActor = telegram_('getChatMember', { chat_id: row[0], user_id: row[1] }, config.botToken).result;
+    if (!telegramMembershipAllowsSearch_(actor) || String(actor.user.id) !== String(row[1]) ||
+        !inputActor || !inputActor.user || String(inputActor.user.id) !== String(row[1]) ||
+        !(['creator', 'administrator'].indexOf(inputActor.status) !== -1 ||
+          (telegramMembershipAllowsSearch_(inputActor) &&
+            (inputActor.can_invite_users === true || (inputActor.status === 'member' &&
+              inputChat.permissions && inputChat.permissions.can_invite_users === true))))) {
+      row[3] = 'INACTIVE'; return;
+    }
+    }
+    const bot = telegram_('getChatMember', { chat_id: row[0], user_id: String(me.id) }, config.botToken).result;
+    if (!bot || !bot.user || String(bot.user.id) !== String(me.id) ||
+        ['administrator', 'creator'].indexOf(bot.status) === -1) return;
+    row[3] = 'ACTIVE'; row[4] = bot.status; row[5] = new Date().toISOString();
+    row[6] = config.botTokenFingerprint;
+  } catch (ignored) { /* Unknown permissions remain pending and are retried. */ }
+}
+
+function trustedMigrationSeed_(row, config) {
+  return row[7] === 'MIGRATION_VERIFIED' ||
+    (String(row[0]) === String(config.allowedChatId) && !row[1] && Boolean(row[5]));
+}
+
+function processPendingEnrollments() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { processed: 0 };
+  try {
+    const config = getConfig_(false), spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+    requireVerifiedOutputGroups_(config);
+    const sheet = spreadsheet.getSheetByName('Groups'), rows = groupRows_(spreadsheet);
+    const properties = PropertiesService.getScriptProperties();
+    let cursor = Number(properties.getProperty('ENROLLMENT_CURSOR') || 0), processed = 0;
+    for (let scanned = 0; scanned < rows.length && processed < 2; scanned++) {
+      const index = (cursor + scanned) % rows.length, row = rows[index];
+      if (row[3] !== 'PENDING' && !(row[3] === 'ACTIVE' && row[6] !== config.botTokenFingerprint)) continue;
+      if (trustedMigrationSeed_(row, config)) row[7] = 'MIGRATION_VERIFIED';
+      verifyEnrollmentRow_(row, config); processed++;
+      sheet.getRange(index + 2, 1, 1, GROUP_HEADERS.length).setValues([row]);
+      properties.setProperty('ENROLLMENT_CURSOR', String((index + 1) % rows.length));
+    }
+    return { processed: processed };
+  } finally { lock.releaseLock(); }
+}
+
+function migrateSharedCatalog() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) throw new Error('Migration is busy.');
+  try {
+    const config = getConfig_(true), properties = PropertiesService.getScriptProperties();
+    const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+    const records = spreadsheet.getSheetByName('Records');
+    if (!records) throw new Error('Run setupPoc() first.');
+    if (sharedCatalogEnabled_()) {
+      requireVerifiedOutputGroups_(config); prepareRecordsSheet_(records);
+      const registry = spreadsheet.getSheetByName('Groups');
+      if (!registry) throw new Error('Groups registry is missing.');
+      prepareGroupRegistry_(registry);
+      return { version: 3, migrated: false };
+    }
+    // Authenticate the old token-bound marker and actual bot/chat identities before seeding.
+    const groups = parseOutputGroupIds_(config);
+    if (config.outputGroupsVerifiedFor !== outputGroupVerificationMarker_(groups, config.botTokenFingerprint)) {
+      throw new Error('Existing v2 verification is required before migration.');
+    }
+    verifyCurrentBotMemberships_(config, groups);
+    prepareRecordsSheet_(records);
+    let registry = spreadsheet.getSheetByName('Groups');
+    registry = registry || spreadsheet.insertSheet('Groups'); prepareGroupRegistry_(registry);
+    if (!groupRows_(spreadsheet).some(function (row) { return String(row[0]) === groups.inputChatId; })) {
+      registry.appendRow([groups.inputChatId, '', '000000000000:0000000000000000', 'ACTIVE', 'administrator', new Date().toISOString(), config.botTokenFingerprint, 'MIGRATION_VERIFIED']);
+    }
+    // No legacy row is reclassified, requeued or granted new eligibility.
+    const migratedProperties = {};
+    migratedProperties[OUTPUT_GROUP_VERIFICATION_PROPERTY] = sharedOutputMarker_(config);
+    migratedProperties[SHARED_CATALOG_PROPERTY] = '3';
+    properties.setProperties(migratedProperties);
+    return { version: 3, migrated: true };
+  } finally { lock.releaseLock(); }
+}
+
+function captionVersion_(message, update) {
+  return String(Number(message.edit_date || message.date || 0)).padStart(12, '0') + ':' +
+    String(Number(update.update_id || 0)).padStart(16, '0');
+}
+
+function applyCaptionVersion_(row, caption, version) {
+  if (String(row[RECORD_FIELD.CAPTION_VERSION] || '') >= version) return false;
+  if (!row[RECORD_FIELD.CAPTION_VERSION]) row[RECORD_FIELD.ORIGINAL_CAPTION] = row[10] || '';
+  row[10] = sheetText_(String(caption || ''));
+  row[RECORD_FIELD.LATEST_CAPTION] = row[10]; row[RECORD_FIELD.CAPTION_VERSION] = version;
+  row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+  row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
+  row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+  return true;
+}
+
+function applyPendingCaptionEdits_(row, events) {
+  if (events.getLastRow() < 2) return;
+  events.getRange(2, 1, events.getLastRow() - 1, EVENT_HEADERS.length).getValues().forEach(function (event) {
+    if (event[4] !== 'caption-edit' || String(event[6]) !== String(row[0])) return;
+    try {
+      const edit = JSON.parse(readSheetText_(event[5]));
+      applyCaptionVersion_(row, edit.caption, edit.version);
+    } catch (ignored) {}
+  });
+}
+
+function processCaptionEdit_(update, message, records, events) {
+  if (!message.photo || !message.photo.length) return 'unsupported';
+  const id = makeRecordId_(message), number = findRecordRow_(records, id);
+  const edit = { caption: String(message.caption || ''), version: captionVersion_(message, update) };
+  if (number) {
+    const row = records.getRange(number, 1, 1, RECORD_HEADERS.length).getValues()[0];
+    if (!applyCaptionVersion_(row, edit.caption, edit.version)) return 'stale';
+    records.getRange(number, 1, 1, RECORD_HEADERS.length).setValues([row]);
+  }
+  appendEvent_(events, update, message, 'caption-edit', sheetText_(JSON.stringify(edit)), id);
+  return number ? 'caption-updated' : 'caption-pending';
+}
+
+function recordPublishCaption_(row) {
+  const human = [row[10], row[18], row[9], row[RECORD_FIELD.ADJACENT_AFTER_TEXT]]
+    .map(readSheetText_).filter(Boolean).join(' · ');
+  if (String(row[16]) === 'TAG_UNAVAILABLE') {
+    return (Array.from(stripLoneSurrogates_(human)).slice(0, 900).join('') + '\nAnalysis unavailable.').trim();
+  }
+  return buildPublishCaption_(row[RECORD_FIELD.AI_METADATA_JSON], human);
+}
+
+function stageIsPaused_(stage) {
+  if (typeof PropertiesService === 'undefined') return false;
+  return Boolean(PropertiesService.getScriptProperties().getProperty('STAGE_PAUSED_' + stage));
+}
+
+function pauseStageForError_(stage, error) {
+  const code = Number(error && error.httpStatus || 0);
+  const raw = String(error && error.message || '');
+  if (!error.stageConfiguration && [401, 403, 507].indexOf(code) === -1 &&
+      !/quota|storage.*(?:full|exceed)|permission|access denied|invalid.*(?:key|credential)|unauthorized/i.test(raw)) return false;
+  PropertiesService.getScriptProperties().setProperty('STAGE_PAUSED_' + stage,
+    JSON.stringify({ at: new Date().toISOString(), reason: 'Operator recovery required.' }));
+  return true;
+}
+
+function catalogHealth() {
+  const p = PropertiesService.getScriptProperties(), config = getConfig_(false);
+  const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
+  const rows = sheet && sheet.getLastRow() > 1
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues() : [];
+  const fields = { archive: RECORD_FIELD.ARCHIVE_STATUS, analysis: 16,
+    publication: RECORD_FIELD.PUBLISH_STATUS, caption: RECORD_FIELD.CAPTION_SYNC_STATUS };
+  return Object.keys(fields).map(function (stage) {
+    let backlog = 0, failed = 0;
+    rows.forEach(function (row) {
+      const status = String(row[fields[stage]] || '');
+      if (/PENDING|RETRY|WAITING|^(ARCHIVING|TAGGING|PUBLISHING|SYNCING)$/.test(status)) backlog++;
+      if (/FAILED|ERROR|UNAVAILABLE|CONFLICT|UNKNOWN/.test(status)) failed++;
+    });
+    return { stage: stage, paused: Boolean(p.getProperty('STAGE_PAUSED_' + stage)),
+      backlog: backlog, failed: failed, recovery: 'recoverCatalogStage("' + stage + '")' };
+  });
+}
+
+function recoverCatalogStage(stage) {
+  if (['archive', 'analysis', 'publication', 'caption'].indexOf(stage) === -1) throw new Error('Unknown stage.');
+  PropertiesService.getScriptProperties().deleteProperty('STAGE_PAUSED_' + stage);
+  return { stage: stage, paused: false };
+}
+
+function releasePausedTagClaim_(config, claim) {
+  const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
+  const lock = LockService.getScriptLock(); if (!lock.tryLock(10000)) return;
+  try {
+    const n = findRecordRow_(sheet, claim.recordId);
+    const row = sheet.getRange(n, 1, 1, RECORD_HEADERS.length).getValues()[0];
+    if (row[16] !== 'TAGGING' || Number(row[21]) !== claim.attempts ||
+        (claim.claimId && row[RECORD_FIELD.TAG_CLAIM_ID] !== claim.claimId)) return;
+    row[RECORD_FIELD.TAG_CLAIM_ID] = '';
+    row[16] = 'TAG_RETRY'; row[21] = Math.max(0, claim.attempts - 1); row[22] = '';
+    sheet.getRange(n, 1, 1, RECORD_HEADERS.length).setValues([row]);
+  } finally { lock.releaseLock(); }
+}
+
+function refundPublicationAttempt_(sheet, claim) {
+  const lock = LockService.getScriptLock(); if (!lock.tryLock(10000)) return;
+  try {
+    const row = sheet.getRange(claim.rowNumber, 1, 1, RECORD_HEADERS.length).getValues()[0];
+    if (row[0] === claim.recordId && row[RECORD_FIELD.PUBLISH_STATUS] === 'PUBLISH_RETRY' &&
+        Number(row[RECORD_FIELD.PUBLISH_ATTEMPTS]) === claim.attempts) {
+      row[RECORD_FIELD.PUBLISH_ATTEMPTS] = Math.max(0, claim.attempts - 1);
+      sheet.getRange(claim.rowNumber, 1, 1, RECORD_HEADERS.length).setValues([row]);
+    }
+  } finally { lock.releaseLock(); }
+}
+
+function processPendingArchives() {
+  if (stageIsPaused_('archive')) return { processed: 0, paused: true };
+  const config = getConfig_(false), sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
+  const claims = [], lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { processed: 0 };
+  try {
+    if (!sheet || sheet.getLastRow() < 2) return { processed: 0 };
+    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues();
+    rows.forEach(function (row, index) {
+      if (claims.length >= 2 || !row[RECORD_FIELD.ADMITTED_GROUP_ID]) return;
+      const status = String(row[RECORD_FIELD.ARCHIVE_STATUS]);
+      if (['ARCHIVE_PENDING', 'ARCHIVE_RETRY', 'ARCHIVING'].indexOf(status) === -1) return;
+      const deadline = status === 'ARCHIVING' ? row[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC] : row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC];
+      if (deadline && (!canonicalIsoInstant_(deadline) || Date.parse(deadline) > Date.now())) return;
+      const attempts = Number(row[RECORD_FIELD.ARCHIVE_ATTEMPTS] || 0);
+      if (attempts >= 5) { row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVE_FAILED_TERMINAL'; }
+      else {
+        row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVING';
+        row[RECORD_FIELD.ARCHIVE_ATTEMPTS] = attempts + 1;
+        row[RECORD_FIELD.ARCHIVE_CLAIM_ID] = Utilities.getUuid();
+        row[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC] = new Date(Date.now() + 600000).toISOString();
+        claims.push({ number: index + 2, row: row.slice(), id: row[RECORD_FIELD.ARCHIVE_CLAIM_ID] });
+      }
+      sheet.getRange(index + 2, 1, 1, RECORD_HEADERS.length).setValues([row]);
+    });
+  } finally { lock.releaseLock(); }
+  claims.forEach(function (claim) {
+    let stored, error;
+    try {
+      if (stageIsPaused_('archive')) { const paused = new Error('Stage paused.'); paused.stageAlreadyPaused = true; throw paused; }
+      const message = JSON.parse(claim.row[RECORD_FIELD.INTAKE_JSON]);
+      stored = storePhoto_(largestPhoto_(message.photo), message, String(claim.row[0]), config);
+    } catch (failure) { error = failure; }
+    const saveLock = LockService.getScriptLock(); if (!saveLock.tryLock(10000)) return;
+    try {
+      const row = sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length).getValues()[0];
+      if (row[RECORD_FIELD.ARCHIVE_CLAIM_ID] !== claim.id || row[RECORD_FIELD.ARCHIVE_STATUS] !== 'ARCHIVING') return;
+      row[RECORD_FIELD.ARCHIVE_CLAIM_ID] = ''; row[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC] = '';
+      if (error) {
+        if (error.stageAlreadyPaused || pauseStageForError_('archive', error)) {
+          row[RECORD_FIELD.ARCHIVE_ATTEMPTS] = Math.max(0, Number(row[RECORD_FIELD.ARCHIVE_ATTEMPTS]) - 1);
+          row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVE_RETRY'; row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC] = '';
+          row[RECORD_FIELD.ARCHIVE_ERROR] = 'Stage paused; operator recovery required.';
+        } else {
+          const failure = archiveFailureDisposition_(error, row[RECORD_FIELD.ARCHIVE_ATTEMPTS]);
+          row[RECORD_FIELD.ARCHIVE_STATUS] = failure.status;
+          row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC] = failure.nextAttempt;
+          row[RECORD_FIELD.ARCHIVE_ERROR] = 'Archive attempt failed.';
+        }
+        row[16] = row[RECORD_FIELD.ARCHIVE_STATUS];
+      } else {
+        row[13] = stored.id; row[14] = stored.url;
+        row[RECORD_FIELD.ARCHIVE_MIME_TYPE] = stored.mimeType;
+        row[RECORD_FIELD.ARCHIVE_BYTE_SIZE] = stored.byteSize;
+        row[RECORD_FIELD.ARCHIVE_SHA256] = stored.sha256;
+        row[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC] = stored.completedAtUtc;
+        row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVED'; row[RECORD_FIELD.ARCHIVE_ERROR] = '';
+        row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC] = '';
+        // Later activation never turns an ineligible receipt into work.
+        row[16] = row[RECORD_FIELD.ANALYSIS_ADMITTED_AT_UTC] ? 'TAG_PENDING' : 'TAG_NOT_ELIGIBLE';
+      }
+      sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length).setValues([row]);
+    } finally { saveLock.releaseLock(); }
+  });
+  return { processed: claims.length };
+}
+
+function requestCatalogEnrichment(recordId) {
+  const config = getConfig_(false), sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
+  const lock = LockService.getScriptLock(); if (!lock.tryLock(10000)) throw new Error('Catalog is busy.');
+  try {
+    const n = findRecordRow_(sheet, recordId); if (!n) throw new Error('Record not found.');
+    const row = sheet.getRange(n, 1, 1, RECORD_HEADERS.length).getValues()[0];
+    if (!archiveRowIsReady_(row) || row[16] !== 'TAG_UNAVAILABLE') throw new Error('Record is not eligible for explicit enrichment.');
+    row[16] = 'TAG_PENDING'; row[21] = 0; row[22] = ''; row[17] = '';
+    if (!row[RECORD_FIELD.OUTPUT_MESSAGE_ID] && row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] &&
+        ['PUBLISH_PENDING', 'PUBLISH_RETRY'].indexOf(row[RECORD_FIELD.PUBLISH_STATUS]) !== -1) {
+      row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_WAITING_FOR_ENRICHMENT';
+    }
+    sheet.getRange(n, 1, 1, RECORD_HEADERS.length).setValues([row]);
+  } finally { lock.releaseLock(); }
+}
+
+function processPendingCaptionSync() {
+  if (stageIsPaused_('caption')) return { processed: 0, paused: true };
+  const config = getConfig_(false); requireVerifiedOutputGroups_(config);
+  const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
+  const lock = LockService.getScriptLock(), claims = [];
+  if (!lock.tryLock(10000)) return { processed: 0 };
+  try {
+    if (!sheet || sheet.getLastRow() < 2) return { processed: 0 };
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues().forEach(function (row, index) {
+      if (claims.length >= 2 || row[RECORD_FIELD.PUBLISH_STATUS] !== 'PUBLISHED' ||
+          String(row[RECORD_FIELD.OUTPUT_CHAT_ID]) !== config.outputChatId || !row[RECORD_FIELD.OUTPUT_MESSAGE_ID] ||
+          !archiveRowIsReady_(row)) return;
+      const status = row[RECORD_FIELD.CAPTION_SYNC_STATUS];
+      const deadline = status === 'SYNCING' ? row[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] : row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC];
+      if (['SYNC_PENDING', 'SYNC_RETRY', 'SYNCING'].indexOf(status) === -1 ||
+          (deadline && (!canonicalIsoInstant_(deadline) || Date.parse(deadline) > Date.now()))) return;
+      const attempts = Number(row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] || 0);
+      if (attempts >= 5) {
+        row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_FAILED';
+        row[RECORD_FIELD.CAPTION_SYNC_ERROR] = 'Maximum caption synchronization attempts reached.';
+      }
+      else {
+        const caption = recordPublishCaption_(row), id = Utilities.getUuid();
+        row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNCING'; row[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID] = id;
+        row[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] = new Date(Date.now() + 600000).toISOString();
+        row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = attempts + 1;
+        claims.push({ number: index + 2, row: row.slice(), caption: caption, id: id });
+      }
+      sheet.getRange(index + 2, 1, 1, RECORD_HEADERS.length).setValues([row]);
+    });
+  } finally { lock.releaseLock(); }
+  claims.forEach(function (claim) {
+    let error;
+    try {
+      if (stageIsPaused_('caption')) { const paused = new Error('Stage paused.'); paused.stageAlreadyPaused = true; throw paused; }
+      telegram_('editMessageCaption', { chat_id: config.outputChatId,
+        message_id: claim.row[RECORD_FIELD.OUTPUT_MESSAGE_ID], caption: claim.caption }, config.botToken);
+    } catch (failure) { error = failure; }
+    const saveLock = LockService.getScriptLock(); if (!saveLock.tryLock(10000)) return;
+    try {
+      const row = sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length).getValues()[0];
+      if (row[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID] !== claim.id) {
+        // A stale remote edit may have landed after a newer edit. Force a final latest-caption write.
+        if (!error) {
+          row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+          row[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID] = '';
+          row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
+          row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+          sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length).setValues([row]);
+        }
+        return;
+      }
+      const changed = recordPublishCaption_(row) !== claim.caption;
+      row[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID] = ''; row[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] = '';
+      if (changed) { row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING'; }
+      else if (error) {
+        const paused = error.stageAlreadyPaused || pauseStageForError_('caption', error);
+        row[RECORD_FIELD.CAPTION_SYNC_ERROR] = 'Caption synchronization failed' +
+          (Number(error.httpStatus) ? ' (HTTP ' + Number(error.httpStatus) + ')' : '') + '.';
+        const attempts = Number(row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS]);
+        row[RECORD_FIELD.CAPTION_SYNC_STATUS] = paused || attempts < 5 ? 'SYNC_RETRY' : 'SYNC_FAILED';
+        if (paused) row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = Math.max(0, attempts - 1);
+        row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = paused ? '' :
+          new Date(Date.now() + Math.max(publishBackoffMinutes_(attempts) * 60000, Number(error.retryAfterSeconds || 0) * 1000)).toISOString();
+      } else {
+        row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNCED';
+        row[RECORD_FIELD.CAPTION_SYNC_ERROR] = '';
+        row[RECORD_FIELD.PUBLISH_CAPTION] = claim.caption;
+        row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+      }
+      sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length).setValues([row]);
+    } finally { saveLock.releaseLock(); }
+  });
+  return { processed: claims.length };
+}
+
+function installSharedCatalogWorkers() {
+  if (!sharedCatalogEnabled_()) throw new Error('Migrate the catalog first.');
+  ['processPendingArchives', 'processPendingEnrollments', 'processPendingCaptionSync'].forEach(replaceTimeTrigger_);
+  return { installed: true };
+}
+
+function providerRetryAfterSeconds_(response) {
+  try {
+    const headers = response.getHeaders(), retry = headers['Retry-After'] || headers['retry-after'];
+    return Math.max(0, Number(retry) || (Date.parse(retry) - Date.now()) / 1000 || 0);
+  } catch (ignored) { return 0; }
+}
+
+function prepareGroupRegistry_(sheet) {
+  ensureSheetColumns_(sheet, GROUP_HEADERS.length);
+  if (sheet.getLastRow() > 0) {
+    const first = GROUP_HEADERS.slice(0, 7);
+    if (!headersMatch_(sheet.getRange(1, 1, 1, first.length).getValues()[0], first) ||
+        !recordsExtensionSchemaIsSafe_(sheet.getRange(1, 8, sheet.getLastRow(), 1).getValues(), GROUP_HEADERS.slice(7))) {
+      throw new Error('Groups columns are occupied by an unknown schema.');
+    }
+  }
+  prepareSheet_(sheet, GROUP_HEADERS);
 }
