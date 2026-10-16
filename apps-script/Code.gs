@@ -175,6 +175,9 @@ function processUpdate_(update, config) {
   if (isPrivateMessage_(message)) {
     return processPrivateCommand_(update, message, config);
   }
+  if (isGroupMessage_(message) && String(message.chat.id) === config.outputChatId) {
+    return processOutputGroupCommand_(update, message, config);
+  }
   if (String(message.chat.id) !== config.allowedChatId) return 'ignored';
 
   const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
@@ -207,7 +210,36 @@ function processPrivateCommand_(update, message, config) {
     sendText_(message.chat.id, 'This Telegram account is not authorized.', config);
     return 'unauthorized';
   }
+  return processSearchCommand_(update, message, config, command, false);
+}
 
+function processOutputGroupCommand_(update, message, config) {
+  if (!isGroupMessage_(message) || String(message.chat.id) !== config.outputChatId ||
+      message.sender_chat || !message.from || message.from.is_bot !== false ||
+      !/^[1-9]\d*$/.test(String(message.from.id || ''))) return 'ignored';
+  const match = firstLine_(message.text || '')
+    .match(/^\/search(?:@([A-Za-z0-9_]+))?(?:\s+(.*))?$/i);
+  if (!match) return 'unsupported';
+  try {
+    requireVerifiedOutputGroups_(config);
+    if (match[1]) {
+      const me = telegram_('getMe', {}, config.botToken).result;
+      if (!me || me.is_bot !== true || !me.username ||
+          match[1].toLowerCase() !== String(me.username).toLowerCase()) return 'ignored';
+    }
+  } catch (error) {
+    console.warn('Group search identity verification failed; access denied.');
+    return 'ignored';
+  }
+  if (!isCurrentSearchGroupMember_(String(message.from.id), config, config.outputChatId)) {
+    sendText_(message.chat.id, 'This Telegram account is not authorized.', config);
+    return 'unauthorized';
+  }
+  return processSearchCommand_(update, message, config,
+    { name: 'search', query: String(match[2] || '').trim() }, true);
+}
+
+function processSearchCommand_(update, message, config, command, outputGroupSearch) {
   const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
   const records = spreadsheet.getSheetByName('Records');
   const events = spreadsheet.getSheetByName('Events');
@@ -235,7 +267,11 @@ function processPrivateCommand_(update, message, config) {
     return 'search-too-long';
   }
 
-  const search = searchWithGeminiFallback_(spreadsheet, records, command.query, 5);
+  const search = outputGroupSearch
+    ? { mode: 'Lexical fallback', results: searchPublishedGroupRecords_(
+      records, command.query, 5, config
+    ) }
+    : searchWithGeminiFallback_(spreadsheet, records, command.query, 5);
   const results = search.results;
   if (!results.length) {
     sendText_(
@@ -452,10 +488,19 @@ function validateArchiveBlob_(blob) {
     throw permanentArchiveError_('Telegram download did not return an image blob.');
   }
   const bytes = blob.getBytes();
-  const mimeType = String(blob.getContentType() || '').toLowerCase();
+  let mimeType = String(blob.getContentType() || '').toLowerCase();
   if (!bytes.length) throw permanentArchiveError_('Downloaded image is empty.');
   if (bytes.length > 20 * 1024 * 1024) {
     throw permanentArchiveError_('Downloaded image exceeds the Telegram hosted download limit.');
+  }
+  if (mimeType === 'application/octet-stream') {
+    const recognized = ['image/jpeg', 'image/png', 'image/webp'].filter(function (type) {
+      return imageSignatureMatchesMime_(bytes, type);
+    });
+    if (recognized.length === 1) {
+      mimeType = recognized[0];
+      blob.setContentType(mimeType);
+    }
   }
   if (['image/jpeg', 'image/png', 'image/webp'].indexOf(mimeType) === -1) {
     throw permanentArchiveError_('Unsupported archived image type: ' + mimeType);
@@ -983,10 +1028,10 @@ function telegramMembershipAllowsSearch_(membership) {
   return status === 'restricted' && membership.is_member === true;
 }
 
-function isCurrentSearchGroupMember_(userId, config) {
+function isCurrentSearchGroupMember_(userId, config, chatId) {
   try {
     const membership = telegram_('getChatMember', {
-      chat_id: config.allowedChatId,
+      chat_id: chatId || config.allowedChatId,
       user_id: String(userId)
     }, config.botToken).result;
     return telegramMembershipAllowsSearch_(membership) &&
@@ -3447,6 +3492,18 @@ function searchRecords_(sheet, query, limit) {
       'ALLOW_LEGACY_UNVERIFIED_LEXICAL_SEARCH'
     ) === 'true'
   );
+}
+
+function searchPublishedGroupRecords_(sheet, query, limit, config) {
+  if (sheet.getLastRow() < 2) return [];
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length)
+    .getValues().filter(function (row) {
+      return String(row[1]) === config.allowedChatId &&
+        String(row[RECORD_FIELD.PUBLISH_STATUS]) === 'PUBLISHED' &&
+        String(row[RECORD_FIELD.OUTPUT_CHAT_ID]) === config.outputChatId &&
+        /^[1-9]\d*$/.test(String(row[RECORD_FIELD.OUTPUT_MESSAGE_ID] || ''));
+    });
+  return rankRecordValues_(rows, query, limit, false);
 }
 
 function privateCommand_(message) {

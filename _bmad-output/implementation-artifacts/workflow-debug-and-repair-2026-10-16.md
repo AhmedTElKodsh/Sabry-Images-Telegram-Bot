@@ -1,8 +1,50 @@
 # Workflow investigation and repair — October 16, 2026
 
-## Outcome
+## Latest live acceptance — school group search
 
-The incident is not resolved live. The local release now repairs the confirmed
+The user approved implementing shared output-group bot search and a full safe-photo
+test. Version 4 is deployed to the existing endpoint. `/search كتاب` now replies
+inside Elardh_Images_Group after current output-membership verification; private
+allowlisting is not required for group commands. Results are restricted to healthy
+photos already PUBLISHED to that group, not the unpublished input archive.
+
+Verified live on October 16, 2026 (Cairo UI times):
+
+- Version 3 first demonstrated a group command reply at 13:47, with no matching photo.
+- Approved fixture: `test-images/02-plant-and-book.png`, a plant and blue book with no
+  people, caption `كتاب اختبار`. User approved Telegram, Drive, Groq and output use.
+- First input message 9 failed archive validation because Telegram served generic
+  application/octet-stream. The terminal failed row was preserved. This exposed and
+  reproduced a MIME handling defect; the repair recognizes generic MIME only when
+  bytes match an existing supported signature and sets the blob type without
+  modifying the bytes. Explicit MIME/signature conflicts still fail.
+- Version 4 contains group search and the reviewed MIME correction. Normalized
+  Code.gs SHA-256 matches local and final editor source:
+  `74d898aacc1c4d6ff0b0471f726e80f7e0de42d2c32d5d202259cf8421d0b5c7`.
+- Fresh input record `-1004439324869:10`: ARCHIVED, 200935 bytes, canonical integrity
+  ready; TAGGED on attempt 1 by qwen/qwen3.8-27b; metadata valid; PUBLISHED to the
+  intended output as message 12. Capture webhook completed at 13:54:15.
+- Output command message 13, `/search كتاب`, returned the same plant/book photo as
+  message 14 with `1/1 · Lexical fallback · matched 1/1 query terms`. Search webhook
+  completed at 13:58:40. The visible photo and bilingual description were checked.
+- A repeated worker run processed zero new tags/publications and retained the
+  original output_message_id 12. A search result is an intentional reply and is
+  distinct from duplicate automatic publication.
+- Temporary safe probe removed from editor; final source parity rechecked. It was
+  never included in an immutable deployment. No credential settings were inspected.
+- All five local suites, syntax and diff checks pass; independent review found no
+  issues in either change. Offline integration tests cover members outside the
+  private allowlist, revoked/failed membership, mismatched IDs, other bots, wrong
+  groups, deduplication, publication filtering and private-search regression.
+
+The live synthetic input → archive → Groq → output → group-search flow is verified.
+This does not establish school-wide search quality, real-photo provider approval,
+or a second live test using another member's account. Earlier archive history and
+private multi-result delivery limitations remain as recorded below.
+
+## Earlier recovery outcome (before shared group search)
+
+At the earlier recovery checkpoint, the incident was not yet resolved live. The release repaired the confirmed
 bootstrap overwrite, retired default model, unsafe provider-error propagation,
 unbounded metadata instructions and false tagging-success count. Offline regression
 checks pass, and version 2 containing the repairs is deployed in the new Google

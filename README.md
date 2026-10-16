@@ -88,6 +88,26 @@ Expected: three `Records` rows, three Drive files, both Plant lines attached to
 the second record, and a 👍 reaction on every saved image or associated
 after-line. Replying directly to a photo is also supported.
 
+## School members searching in the output group
+
+Members of the configured, verified output group can send `/search كتاب` there.
+`/search@SchoolImages_bot كتاب` is also supported for this bot's current username.
+The bot verifies the sender's current output-group membership for each command;
+members do not need individual `SEARCH_USER_IDS` entries or input-group membership.
+Anonymous administrator/channel senders, bot senders, commands addressed to other
+bots and unrelated groups are ignored. Telegram membership lookup failures deny
+access. The bot must retain administrator rights so membership checks are reliable.
+
+Group results are limited to five healthy archived photos already recorded as
+`PUBLISHED` to this exact output group with an output message ID. Pending, failed,
+unpublished and legacy unverified images are excluded. Results are posted back to
+the same group with protected content, using local caption/tag/OCR ranking. Group
+queries do not activate the optional Gemini pilot. An empty result produces a
+clear response; `/search` alone shows usage. Telegram's built-in group search is
+also available for existing published captions.
+
+Private search retains the separate allowlist and input-group membership rules below.
+
 ## Private search baseline
 
 Each allowlisted user must open the bot privately and send `/start` once, then
@@ -379,5 +399,7 @@ performs the non-destructive configuration checklist above.
 node tests/self_check.js
 node tests/archive_retry_check.js
 node tests/workflow_recovery_check.js
+node tests/output_group_search_check.js
+node tests/archive_mime_check.js
 Get-Content -Raw -LiteralPath 'apps-script\Code.gs' | node --check -
 ```
