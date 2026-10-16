@@ -4634,15 +4634,111 @@ function catalogHealth() {
   const fields = { archive: RECORD_FIELD.ARCHIVE_STATUS, analysis: 16,
     publication: RECORD_FIELD.PUBLISH_STATUS, caption: RECORD_FIELD.CAPTION_SYNC_STATUS };
   return Object.keys(fields).map(function (stage) {
-    let backlog = 0, failed = 0;
+    let backlog = 0, failed = 0, historicalBacklog = 0, historicalFailed = 0;
     rows.forEach(function (row) {
       const status = String(row[fields[stage]] || '');
-      if (/PENDING|RETRY|WAITING|^(ARCHIVING|TAGGING|PUBLISHING|SYNCING)$/.test(status)) backlog++;
-      if (/FAILED|ERROR|UNAVAILABLE|CONFLICT|UNKNOWN/.test(status)) failed++;
+      const prefix = {archive: 'ARCHIV', analysis: 'TAG', publication: 'PUBLISH', caption: 'SYNC'}[stage];
+      if (status.indexOf(prefix) !== 0) return;
+      const current = stage === 'archive' ? Boolean(row[RECORD_FIELD.ADMITTED_GROUP_ID]) :
+        stage === 'analysis' ? groqRowIsInsideActivationScope_(row,
+          groqActivationState_(Object.assign({}, config, {groqTaggingEnabled: true}))) :
+        stage === 'publication' ? Boolean(row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC]) :
+        Boolean(row[RECORD_FIELD.OUTPUT_MESSAGE_ID]);
+      if (/PENDING|RETRY|WAITING|^(ARCHIVING|TAGGING|PUBLISHING|SYNCING)$/.test(status)) {
+        if (current) backlog++; else historicalBacklog++;
+      }
+      if (/FAILED|ERROR|UNAVAILABLE|CONFLICT|UNKNOWN/.test(status)) {
+        if (current) failed++; else historicalFailed++;
+      }
     });
     return { stage: stage, paused: Boolean(p.getProperty('STAGE_PAUSED_' + stage)),
-      backlog: backlog, failed: failed, recovery: 'recoverCatalogStage("' + stage + '")' };
+      backlog: backlog, failed: failed, historicalBacklog: historicalBacklog,
+      historicalFailed: historicalFailed, recovery: 'recoverCatalogStage("' + stage + '")' };
   });
+}
+
+// Explicit archive-only repair: historical rows never receive intake/publication admission.
+function recoverHistoricalArchive(recordId) {
+  const config = getConfig_(false), book = SpreadsheetApp.openById(config.spreadsheetId);
+  const sheet = book.getSheetByName('Records'), events = book.getSheetByName('Events');
+  const lock = LockService.getScriptLock(), claim = Utilities.getUuid();
+  let number, original, claimed;
+  if (!lock.tryLock(10000)) throw new Error('Catalog is busy.');
+  try {
+    const rows = sheet.getLastRow() > 1 ? sheet.getRange(2, 1, sheet.getLastRow()-1, RECORD_HEADERS.length).getValues() : [];
+    const matches = rows.map(function(r,i) { return r[0] === recordId ? i+2 : 0; }).filter(Boolean);
+    if (matches.length !== 1) throw new Error('Expected one exact historical record.');
+    number = matches[0]; original = rows[number-2];
+    if (original[RECORD_FIELD.ADMITTED_GROUP_ID] || original[RECORD_FIELD.ANALYSIS_ADMITTED_AT_UTC] ||
+        original[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] || original[RECORD_FIELD.OUTPUT_MESSAGE_ID] ||
+        (original[RECORD_FIELD.PUBLISH_STATUS] && original[RECORD_FIELD.PUBLISH_STATUS] !== 'PUBLISH_NOT_ELIGIBLE') ||
+        original[RECORD_FIELD.PUBLISH_ATTEMPTS] || original[RECORD_FIELD.PUBLISH_CLAIM_ID] ||
+        original[RECORD_FIELD.PUBLISH_LEASE_UNTIL_UTC] || original[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] ||
+        original[RECORD_FIELD.TAG_CLAIM_ID] || original[RECORD_FIELD.ARCHIVE_CLAIM_ID] ||
+        original[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC] || original[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID]) {
+      throw new Error('Record is admitted, published or claimed; historical repair refused.');
+    }
+    claimed = original.slice(); claimed[RECORD_FIELD.ARCHIVE_CLAIM_ID] = claim;
+    // Manual claims require explicit operator inspection after interruption; workers cannot consume them.
+    sheet.getRange(number,1,1,RECORD_HEADERS.length).setValues([claimed]);
+  } finally { lock.releaseLock(); }
+  try {
+    let stored, file, blob;
+    if (original[13]) {
+      try { file = DriveApp.getFileById(String(original[13])); if (!file.isTrashed()) blob = file.getBlob(); }
+      catch (unavailable) { file = null; }
+    }
+    if (blob) {
+      const integrity = validateArchiveBlob_(blob);
+      stored = {id: original[13], url: original[14], mimeType: integrity.mimeType,
+        byteSize: integrity.byteSize, sha256: integrity.sha256, completedAtUtc: new Date().toISOString()};
+    } else {
+      // Collector v1 wrote UTC instants without fractional seconds.
+      const sentAt = canonicalIsoInstant_(String(original[3]).replace(/(:\d{2})Z$/, '$1.000Z'));
+      if (!original[11] || !sentAt) throw new Error('No usable historical source.');
+      stored = storePhoto_({file_id: String(original[11])},
+        {date: Date.parse(sentAt)/1000}, recordId, config);
+    }
+    [[RECORD_FIELD.ARCHIVE_MIME_TYPE,stored.mimeType], [RECORD_FIELD.ARCHIVE_BYTE_SIZE,stored.byteSize],
+      [RECORD_FIELD.ARCHIVE_SHA256,stored.sha256]].forEach(function(pair) {
+      if (original[pair[0]] !== '' && String(original[pair[0]]) !== String(pair[1])) throw new Error('Historical integrity evidence conflicts.');
+    });
+    if (!lock.tryLock(10000)) throw new Error('Catalog is busy.');
+    try {
+      const current = sheet.getRange(number,1,1,RECORD_HEADERS.length).getValues()[0];
+      if (JSON.stringify(current) !== JSON.stringify(claimed)) throw new Error('Historical record changed during repair.');
+      if (archiveRowIsReady_(original) && original[16] === 'TAG_NOT_ELIGIBLE' && stored.id === original[13]) {
+        current[RECORD_FIELD.ARCHIVE_CLAIM_ID]='';
+        sheet.getRange(number,1,1,RECORD_HEADERS.length).setValues([current]);
+        return {recordId: recordId, status: 'ALREADY_VERIFIED'};
+      }
+      const audit = original.slice(); [17,35,41].forEach(function(i) { if(audit[i]) audit[i]='[historical error withheld]'; });
+      const evidence = JSON.stringify(audit);
+      if (evidence.length > 45000) throw new Error('Historical audit exceeds cell capacity.');
+      events.appendRow(['historical-repair:'+claim, original[1], original[8], '', 'HISTORICAL_ARCHIVE_RECOVERY',
+        sheetText_(evidence), recordId, new Date().toISOString()]);
+      current[13]=stored.id; current[14]=stored.url; current[16]='TAG_NOT_ELIGIBLE'; current[17]='';
+      current[RECORD_FIELD.ARCHIVE_MIME_TYPE]=stored.mimeType;
+      current[RECORD_FIELD.ARCHIVE_BYTE_SIZE]=stored.byteSize; current[RECORD_FIELD.ARCHIVE_SHA256]=stored.sha256;
+      current[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC]=stored.completedAtUtc;
+      current[RECORD_FIELD.ARCHIVE_STATUS]='ARCHIVED'; current[RECORD_FIELD.ARCHIVE_ERROR]='';
+      current[RECORD_FIELD.ARCHIVE_ATTEMPTS]=1; current[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC]='';
+      current[RECORD_FIELD.ARCHIVE_CLAIM_ID]=''; current[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC]='';
+      sheet.getRange(number,1,1,RECORD_HEADERS.length).setValues([current]);
+    } finally { lock.releaseLock(); }
+    return {recordId: recordId, status: 'ARCHIVED'};
+  } catch (failure) {
+    if (lock.tryLock(10000)) {
+      try {
+        const current = sheet.getRange(number,1,1,RECORD_HEADERS.length).getValues()[0];
+        if (current[0] === recordId && current[RECORD_FIELD.ARCHIVE_CLAIM_ID] === claim) {
+          current[RECORD_FIELD.ARCHIVE_CLAIM_ID]='';
+          sheet.getRange(number,1,1,RECORD_HEADERS.length).setValues([current]);
+        }
+      } finally { lock.releaseLock(); }
+    }
+    throw new Error('Historical archive recovery failed; inspect source availability, integrity and audit access.');
+  }
 }
 
 function recoverCatalogStage(stage) {

@@ -179,3 +179,113 @@ replayed. Real school/children images still require the existing provider approv
 - [Google Apps Script Service.getUrl](https://developers.google.com/apps-script/reference/script/service): development-mode execution can return the development URL.
 - [Groq model deprecations](https://console.groq.com/docs/deprecations): September 14 retirement and successor for the old default model.
 - [Groq vision documentation](https://console.groq.com/docs/vision): replacement model supports images and JSON mode.
+
+
+## Operational limitation closure — October 16, evening (in progress)
+
+Owner scope: non-sensitive images; sensitive school/children content is excluded.
+Advanced OCR and semantic retrieval remain deferred. No second output member is
+available, so a second-human-account test remains pending.
+
+The supplied second input invitation resolves to schoolImages_test2,
+chat -5371587584. Bot was already a member; it was promoted with all optional
+administrator powers off to meet the existing capture/enrollment requirement.
+The pre-promotion photo was not admitted (input remained PENDING).
+
+Private backup/restore drill, 17:33–17:34 Cairo:
+- Backup folder: 1rUYRgJtTGvkEfOwpX2wjdNN3mXh0wE9-.
+- Backup Sheet: 1Yl6132BWlpcdvxPWD8yfEhxKzWdTz2_mkmlbUX2ez4Q.
+- Restored Sheet: 1UN5tcevey3AVxMn2iiKS6Cyjgmuq4bwIi8SdgQApZmI.
+- Eight original Records rows matched restored values exactly.
+- Both accessible archive objects (records :10 and :11) were copied and restored;
+  each was 200935 bytes and SHA-256
+  42c6542ffc584862702d2efa327453c4a83f5c4fd0d240fac83c620aef319829.
+- Legacy -5556698493:11 and :25 Drive sources were inaccessible; not backed up.
+- A restore-manifest.json in the private folder maps original/backup/restore IDs.
+- Same-account recovery only; independent account disaster recovery remains untested.
+
+Historical recovery initial attempt made no archive changes: source timestamps
+were legacy UTC strings without fractional seconds, rejected by strict validation.
+The helper now normalizes that exact format, with regression coverage.
+
+Historical recovery retry at 17:42:27–17:42:51 completed for all six exact IDs:
+-5556698493:11, -5556698493:25, -1004439324869:3, :4, :5 and :9.
+All returned ARCHIVED. Existing inaccessible Drive references were retained in
+sanitized original-row audit events; bytes were recovered from Telegram. No old
+Drive objects were deleted. Publication/analysis admission was not granted.
+
+Telegram promoted/upgraded the second basic group to supergroup
+-1004406332620 (visible chat URL); its previous ID was -5371587584.
+
+### Live controlled failure drill (17:47:21–17:48:04 Cairo)
+
+Target: -1004406332620:2, the plant/book fixture captioned
+`كتاب اختباراعطال تعددمصادر نبات وكتاب`. Core actual workers operated against
+real Sheets/Drive. Temporary editor-only overrides injected failures for that
+exact record; scheduled workers remained paused, overrides and pause values were
+restored in finally. Credentials were not altered and no provider outage was induced.
+
+- Real archive succeeded.
+- Injected analysis 401 paused/refunded: TAG_RETRY, attempts 0.
+- Injected analysis 429 honored a 7200-second retry deadline.
+- Four additional injected transient failures reached attempt 5 / TAG_UNAVAILABLE;
+  only the target retry deadlines were advanced to accelerate the drill.
+- Injected publication 403 refunded attempt; injected 429 honored 7200 seconds.
+- Real caption-only fallback published as output message 28.
+- Repeat publication made no duplicate; real Groq enrichment then succeeded and
+  caption sync edited the same output message 28, SYNCED. UI confirmed generated
+  English/Arabic caption and absence of the unavailable-analysis warning.
+
+### Shared input/search acceptance
+
+The successful supergroup promotion used only Change Group Info; all destructive,
+membership, invitation and administrator-creation powers were disabled. Automatic
+my_chat_member enrollment made -1004406332620 ACTIVE at 17:45:22 UTC+3.
+The obsolete pre-upgrade group ID was explicitly retired to SUSPENDED/MIGRATED
+with an Events audit after verifying the ACTIVE successor and same initiator.
+
+Group /search اختباراعطال: command 29 -> one result 30, correct second-input image.
+Group /search نبات كتاب: command 31 -> results 32–34. First result matched 2/2
+query terms, the other two 1/2. This is lexical token coverage, not semantic ranking.
+Group /search زرافةفضائيةغيرموجودة: command 35 -> response 36, no matching photos.
+No school-corpus accuracy percentage is established from these synthetic fixtures.
+
+Final worker resumption at 17:49:38–17:49:44: all stages unpaused, current/historical
+backlog and failure counts zero, all nine archive rows ready, six recovered rows
+TAG_NOT_ELIGIBLE, original published output IDs 12/20 preserved, new output ID28.
+All five managed handlers present; webhook installed; repeat workers processed zero.
+
+Clean source parity after removing temporary helpers:
+SHA-256 f09c2e0bfa7cdacdf67276ca82cc4ad88f0b7a250f72c2a55b58dfdeeb943144.
+Final complete-catalog backup/restore drill completed 17:50:26–17:51:24:
+all nine Records rows matched, and all nine source images were copied/restored
+with matching byte sizes and SHA-256 hashes. No unavailable files remained.
+Backup folder: 1RSC9qrHJgHxveSM322vE3QRXG48xJmw2.
+Backup Sheet: 1mP1Q9PWoHS8mZ_nrzwZyz0QX14V28qhCgG_lSw9Vu4g.
+Restored Sheet: 1pOJ4X44PkC0CCTUwpEiX-vyDGkKJrqj1a0psERJ7Cec.
+The private restore-manifest.json maps each source to backup and restored file.
+
+Functional isolated-restore verification 17:53:36–17:53:45 remapped the copied
+Records Drive IDs/links to restored files, validated all nine via the actual
+archive verifier, and retrieved exactly -1004406332620:2 for اختباراعطال.
+Only the isolated restored sheet was remapped; live catalog references unchanged.
+This is verified same-account restoration, not independent-account recovery.
+
+Version 8 deployed 17:51; smoke /search اختباراعطال command 37 -> result 38.
+Final live diagnostic at 17:53:44: webhook pending 0, no last error; stages
+unpaused, backlog/failures 0; both intended inputs ACTIVE; obsolete old ID
+SUSPENDED/MIGRATED. No second-human-account verification was possible.
+
+A final reviewed health-only correction preserves admitted analysis backlog when
+Groq is temporarily disabled (does not activate processing). New regression passed.
+Final source SHA-256:
+278c314435d12ca78c7fd0f68a631f7df7f97ced506ddf943e4960719f2a0eb3.
+All temporary operator helpers removed; saved-editor parity verified.
+
+Final release: immutable version 9, deployed 17:56 Cairo on the existing endpoint
+with unchanged execution/access configuration. Source hash matches the final
+reviewed local file above; no temporary helpers remain. Version-9 smoke search
+/search اختباراعطال command39 -> correct image result40 (1/1, matched1/1).
+All ten registered local checks, Apps Script syntax and diff checks passed.
+Review findings were fixed; final independent source review found no further
+material defects. No remote push requested or performed.

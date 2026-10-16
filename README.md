@@ -138,9 +138,10 @@ JSON validation rejects malformed or oversized model output. Human captions and
 manual tags are preserved. Provider keys and raw provider responses must never
 enter operational errors or Telegram replies.
 
-The approved live test uses `test-images/02-plant-and-book.png`. It contains no
-people. That approval does not authorize real school or children images through
-a provider; the school's data-use and provider boundary need separate approval.
+The operating scope is a non-sensitive image catalog, as confirmed by the owner;
+sensitive school/children images are excluded. Basic Groq analysis is authorized
+for this scope. The live fixture `test-images/02-plant-and-book.png` contains no
+people. Keep credentials out of captions, images, logs and replies.
 
 ## Teacher search
 
@@ -208,6 +209,16 @@ Choose the affected stage rather than resuming all stages indiscriminately.
 The same wrapper pattern can call `requestCatalogEnrichment('chat_id:message_id')`
 for the specific reviewed record; never bulk-reset catalog rows.
 
+For a historical record that was never admitted, an operator wrapper may call
+`recoverHistoricalArchive('chat_id:message_id')`. It verifies accessible Drive
+bytes or retrieves the retained Telegram file, compares existing integrity
+evidence and saves a sanitized original-row audit event before committing.
+It grants no analysis or publication eligibility. Conflicts and unavailable
+sources fail without replacing the record. An interrupted manual claim requires
+operator inspection; never clear it while its execution is still running.
+`catalogHealth()` separates current backlog/failures from historical counts;
+historical failures remain visible but are not automatic worker work.
+
 Confirmed publication stores `output_message_id`; subsequent runs skip first
 publication. Explicit temporary Telegram rejections may retry. A timeout or
 expired photo-send lease becomes `PUBLISH_UNKNOWN`: delivery might have occurred,
@@ -216,9 +227,12 @@ before any separately authorized resend. Caption edits target a known message
 and can safely retry; Telegram's 'message is not modified' response completes
 that synchronization.
 
-`auditArchive()` provides separate archive health evidence. Drive storage is
-not proof of a tested backup; restoration requires a separately selected backup
-and restoration drill.
+`auditArchive()` provides separate archive health evidence. The October 16
+private same-account restore drill verified a copied Records sheet and accessible
+image byte sizes/SHA-256 hashes; its manifest and precise coverage are recorded
+in `workflow-debug-and-repair-2026-10-16.md` under implementation artifacts.
+Repeat backups after changes. This does not establish independent-account
+recovery or protect against losing the owning Google account.
 
 ## Optional semantic pilot
 
@@ -242,5 +256,5 @@ git diff --check
 ```
 
 Offline fixtures prove the cases they exercise. Live synthetic capture/search
-proves that specific deployed path; neither proves school-corpus relevance,
-live enrollment in several groups, or approval for real school data.
+proves that specific deployed path; it does not establish school-corpus relevance
+or behavior for every group and member.
