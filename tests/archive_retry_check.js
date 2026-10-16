@@ -64,4 +64,15 @@ assert.strictEqual(row[field.ARCHIVE_STATUS], 'ARCHIVE_FAILED_TERMINAL');
 const finalCalls = storageCalls;
 assert.throws(process, /terminal state/);
 assert.strictEqual(storageCalls, finalCalls);
+// Neither the error ledger nor the rethrown execution error may carry a transport token.
+row[field.ARCHIVE_STATUS] = 'ARCHIVE_RETRY';
+row[field.ARCHIVE_ATTEMPTS] = 0;
+row[field.ARCHIVE_NEXT_ATTEMPT_UTC] = '2000-01-01T00:00:00.000Z';
+sandbox.storePhoto_ = () => {
+  throw new Error('Request failed: https://api.telegram.org/file/bot123456:FAKE_TOKEN/p.jpg');
+};
+assert.throws(process, error => !error.message.includes('FAKE_TOKEN') &&
+  error.message.includes('[REDACTED_URL]'));
+assert.ok(!String(row[field.ARCHIVE_ERROR]).includes('FAKE_TOKEN'));
+assert.strictEqual(row[field.ARCHIVE_STATUS], 'ARCHIVE_RETRY');
 console.log('PASS: archive retry redelivery checks');

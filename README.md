@@ -12,6 +12,11 @@ the replacement token in this repository or in the spreadsheet.
 ## Configure and deploy
 
 Repository state is not proof of what is currently deployed in Apps Script.
+After deploying, copy **Manage deployments → Web app URL** into `WEB_APP_URL`.
+It must be the canonical `https://script.google.com/macros/s/<deployment-id>/exec`
+address, without a query or fragment. `bootstrapPoc()` validates this explicit
+address before setup and preserves it; editor execution may report a `/dev`
+service URL, which must never replace the versioned deployment address.
 Before setup, add these required values under **Project Settings → Script
 Properties**:
 
@@ -174,7 +179,13 @@ project when available.
 3. Under **Script Properties**, add:
 
    - `GROQ_API_KEY` = your secret Groq key
-   - `GROQ_MODEL` = `qwen/qwen3.6-27b` (optional; this is the default)
+   - `GROQ_MODEL` = `qwen/qwen3.8-27b` (optional; this is the default)
+
+   Groq retired `qwen/qwen3.6-27b` for free/developer usage on September 14,
+   2026; see its [model deprecation notice](https://console.groq.com/docs/deprecations).
+   An explicit property override is preserved, so update an old override yourself.
+   The image prompt bounds captions, vocabulary lists and representative OCR
+   excerpts to the validator's limits; full-page transcription is not requested.
 
 4. Never put the key in this repository, the Google Sheet, or a Telegram
    message.
@@ -367,5 +378,6 @@ performs the non-destructive configuration checklist above.
 ```powershell
 node tests/self_check.js
 node tests/archive_retry_check.js
+node tests/workflow_recovery_check.js
 Get-Content -Raw -LiteralPath 'apps-script\Code.gs' | node --check -
 ```

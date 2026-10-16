@@ -48,9 +48,16 @@ in this document.
 
 ## Current handoff
 
-The bot remains paused. The target project has not been deployed or activated;
-the final new-photo archive/enrichment/publication/search test is outstanding.
-Do not report end-to-end success.
+Updated October 16: version 1 bootstrap failed after storing a `/dev` service URL.
+A subsequent settings snapshot disclosed replacement credentials. The user then
+confirmed another complete rotation. Version 2 now contains the reviewed bootstrap,
+provider compatibility and safe-error repairs. Group verification, canonical URL
+binding, bootstrap/webhook installation and both new-photo-only worker activations
+completed successfully. Webhook queue is zero with no reported delivery error;
+trigger inventory shows one tag worker and one publication worker. See
+`workflow-debug-and-repair-2026-10-16.md` for detailed evidence and limits.
+The final fresh-photo archive/enrichment/publication/search test is outstanding;
+do not report end-to-end success.
 
 The user must perform credential replacement through secure provider and Script
 Properties UI steps. Do not ask for replacement values in chat or screenshots.
