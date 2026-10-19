@@ -10,6 +10,10 @@ function historical(r) {
   const r=runtime(), row=historical(r);
   r.records.data[1][r.F.PUBLISH_STATUS]='PUBLISH_NOT_ELIGIBLE';
   r.s.storePhoto_=()=>r.archive;
+  let lockedCreates=0;r.s.createOrReusePreparedArchive_=prepared=>{
+    assert.equal(r.lock.tryLock(0),false,'historical digest reuse/create must hold ScriptLock');
+    lockedCreates++;return r.archive;
+  };
   assert.equal(r.s.recoverHistoricalArchive(row[0]).status,'ARCHIVED');
   const saved=r.records.data[1];
   assert.ok(r.s.archiveRowIsReady_(saved));
@@ -18,6 +22,7 @@ function historical(r) {
   assert.equal(r.events.data.length,2);
   assert.equal(JSON.parse(r.events.data[1][5])[r.F.ARCHIVE_STATUS],'ARCHIVE_RETRY');
   assert.equal(r.s.recoverHistoricalArchive(row[0]).status,'ALREADY_VERIFIED');
+  assert.equal(lockedCreates,1,'already-verified legacy recovery must not create or reuse another object');
   assert.equal(r.events.data.length,2);
 }
 for(const missing of [false,true]) {

@@ -106,6 +106,14 @@ JPEG/PNG/WebP bytes and stores it in the private Drive archive. The catalog
 records MIME type, byte size, SHA-256 and completion time. Retries reconcile the
 same deterministic Drive object rather than creating a new image each time.
 
+Exact-byte reuploads remain separate provenance rows, including their source
+chat/message, uploader, timestamps and verbatim caption history. Validated
+SHA-256—not Telegram `file_unique_id`—links prospective matches to one canonical
+owner and one digest-named Drive archive. Aliases do not run analysis, embedding
+or publication work. Distinct current captions and adjacent human context from
+linked uploads are normalized conservatively for uniqueness, retained verbatim
+in Sheets, and synchronized onto the canonical published message.
+
 Store full normalized analysis in `ai_metadata_json`, separate from human
 captions and manual tags. Telegram captions are a bounded search projection;
 they are not the authoritative metadata store. Image bytes are unchanged.
@@ -163,6 +171,10 @@ filtering removes common function words. At least one meaningful term must
 match; coverage, phrase matching and field weights determine order, with stable
 ties. A query containing only stopwords asks for more useful terms. A service
 failure reports temporary unavailability rather than claiming no matches.
+Linked captions participate in matching, but a canonical image occupies only
+one result slot and returns the owner's verified archive. The bounded display
+prioritizes the linked human fragment responsible for a lexical match before
+supplementary AI text.
 
 There is no semantic similarity percentage or universal cosine cutoff in this
 release. Synonyms work only when present in the indexed vocabulary. Later
@@ -218,6 +230,11 @@ sources fail without replacing the record. An interrupted manual claim requires
 operator inspection; never clear it while its execution is still running.
 `catalogHealth()` separates current backlog/failures from historical counts;
 historical failures remain visible but are not automatic worker work.
+`reportHistoricalDuplicateCandidates()` is a deterministic, read-only ledger
+report. It performs no Drive health probe and describes candidate evidence as
+ledger-ready/object-unverified. It never merges old rows, changes eligibility,
+rewrites output IDs, or deletes old Drive objects; historical cleanup remains a
+separately reviewed operator action.
 
 Confirmed publication stores `output_message_id`; subsequent runs skip first
 publication. Explicit temporary Telegram rejections may retry. A timeout or

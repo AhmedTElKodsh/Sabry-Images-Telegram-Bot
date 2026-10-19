@@ -38,6 +38,7 @@ assert.equal(records.data[1][F.OUTPUT_MESSAGE_ID],'7');
 assert.equal(s.meaningfulQueryTokens_('the and في على').length,0);
 // Weighted metadata cannot outrank more meaningful query-token coverage.
 let a=records.data[1].slice(),b=a.slice();a[0]='one';b[0]='two';
+a[F.CANONICAL_RECORD_ID]='';a[F.CANONICAL_ROLE]='';b[F.CANONICAL_RECORD_ID]='';b[F.CANONICAL_ROLE]='';
 a[18]='horse';a[10]='';a[F.AI_METADATA_JSON]='';a[19]='';a[20]='';
 b[18]='';b[10]='horse book';b[F.AI_METADATA_JSON]='';b[19]='';b[20]='';
 assert.equal(s.rankRecordValues_([a,b],'the horse book',5,false)[0].recordId,'two');

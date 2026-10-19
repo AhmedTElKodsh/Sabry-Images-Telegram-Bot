@@ -39,3 +39,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-durable-archive-and-hybrid-search.md`
   summary: Private search needs per-result delivery progress or another replay-safe response design.
   evidence: If a later `sendPhoto` fails after earlier results were delivered, the command event is not appended and Telegram retry can resend the earlier photos.
+- source_spec: `D:/AI Projects/Freelance/Sabry-Images-Telegram-Bot/_bmad-output/implementation-artifacts/spec-canonical-image-deduplication.md`
+  summary: Benchmark and, if necessary, bound caption/context aggregation for very large canonical image groups.
+  evidence: The implementation scans and combines linked provenance text for publication and search; real corpus size and maximum reuploads per image are needed to determine whether Apps Script memory, runtime, or lock limits are reachable.

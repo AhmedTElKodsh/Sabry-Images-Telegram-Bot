@@ -15,7 +15,8 @@ const RECORD_HEADERS = [
   'admitted_group_id', 'admitted_at_utc', 'intake_json', 'archive_claim_id',
   'archive_lease_until_utc', 'original_caption', 'latest_caption', 'caption_version',
   'adjacent_after_text', 'caption_sync_status', 'caption_sync_attempts',
-  'caption_sync_next_attempt_utc', 'caption_sync_claim_id', 'caption_sync_lease_until_utc', 'analysis_admitted_at_utc', 'tag_claim_id', 'caption_sync_error'
+  'caption_sync_next_attempt_utc', 'caption_sync_claim_id', 'caption_sync_lease_until_utc', 'analysis_admitted_at_utc', 'tag_claim_id', 'caption_sync_error',
+  'canonical_record_id', 'canonical_role', 'canonical_linked_at_utc', 'archive_source_record_id'
 ];
 
 const RECORD_FIELD = {
@@ -45,7 +46,9 @@ const RECORD_FIELD = {
   ORIGINAL_CAPTION: 50, LATEST_CAPTION: 51, CAPTION_VERSION: 52,
   ADJACENT_AFTER_TEXT: 53, CAPTION_SYNC_STATUS: 54, CAPTION_SYNC_ATTEMPTS: 55,
   CAPTION_SYNC_NEXT_ATTEMPT_UTC: 56, CAPTION_SYNC_CLAIM_ID: 57,
-  CAPTION_SYNC_LEASE_UNTIL_UTC: 58, ANALYSIS_ADMITTED_AT_UTC: 59, TAG_CLAIM_ID: 60, CAPTION_SYNC_ERROR: 61
+  CAPTION_SYNC_LEASE_UNTIL_UTC: 58, ANALYSIS_ADMITTED_AT_UTC: 59, TAG_CLAIM_ID: 60, CAPTION_SYNC_ERROR: 61,
+  CANONICAL_RECORD_ID: 62, CANONICAL_ROLE: 63, CANONICAL_LINKED_AT_UTC: 64,
+  ARCHIVE_SOURCE_RECORD_ID: 65
 };
 
 const EVENT_HEADERS = [
@@ -377,14 +380,16 @@ function processText_(update, message, records, events) {
   let associatedRecordId = '';
 
   if (row) {
-    const sameUser = String(records.getRange(row, 8).getValue()) === getUserId_(message);
-    const afterIsEmpty = !records.getRange(row, RECORD_FIELD.ADJACENT_AFTER_TEXT + 1).getValue();
+    const values = records.getRange(2, 1, records.getLastRow() - 1, RECORD_HEADERS.length).getValues();
+    const target = values[row - 2];
+    const sameUser = String(target[7]) === getUserId_(message);
+    const afterIsEmpty = !target[RECORD_FIELD.ADJACENT_AFTER_TEXT];
     if (sameUser && afterIsEmpty) {
-      records.getRange(row, RECORD_FIELD.ADJACENT_AFTER_TEXT + 1).setValue(text);
-      records.getRange(row, RECORD_FIELD.CAPTION_SYNC_STATUS + 1).setValue('SYNC_PENDING');
-      records.getRange(row, RECORD_FIELD.CAPTION_SYNC_ATTEMPTS + 1).setValue(0);
-      records.getRange(row, RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC + 1).setValue('');
-      records.getRange(row, RECORD_FIELD.CAPTION_SYNC_ERROR + 1).setValue('');
+      const before = canonicalHumanFragments_(values, target).join(' · ');
+      target[RECORD_FIELD.ADJACENT_AFTER_TEXT] = text;
+      values[row - 2] = target;
+      records.getRange(row, 1, 1, RECORD_HEADERS.length).setValues([target]);
+      queueCanonicalCaptionSync_(records, values, target, before);
       associatedRecordId = previousRecordId;
     }
   }
@@ -394,19 +399,32 @@ function processText_(update, message, records, events) {
 }
 
 function storePhoto_(photo, message, recordId, config) {
+  return createOrReusePreparedArchive_(prepareCanonicalPhoto_(photo, config), config);
+}
+
+function prepareCanonicalPhoto_(photo, config) {
   const fileInfo = telegram_('getFile', { file_id: photo.file_id }, config.botToken);
   const filePath = fileInfo.result.file_path;
-  const extensionMatch = filePath.match(/\.[A-Za-z0-9]{1,5}$/);
-  const extension = extensionMatch ? extensionMatch[0].toLowerCase() : '.jpg';
-  const timestamp = Utilities.formatDate(
-    new Date(message.date * 1000), 'UTC', 'yyyyMMdd_HHmmss'
-  );
-  const fileName = timestamp + '_' + recordId.replace(/[^0-9A-Za-z_-]/g, '_') + extension;
-  const folder = DriveApp.getFolderById(config.driveFolderId);
   const downloaded = fetchOk_(
     'https://api.telegram.org/file/bot' + config.botToken + '/' + filePath
-  ).getBlob().setName(fileName);
+  ).getBlob();
   const integrity = validateArchiveBlob_(downloaded);
+  return { blob: downloaded, mimeType: integrity.mimeType, byteSize: integrity.byteSize,
+    sha256: integrity.sha256 };
+}
+
+function canonicalArchiveFileName_(prepared) {
+  const extension = {'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp'}[prepared.mimeType];
+  if (!extension || !/^[0-9a-f]{64}$/.test(String(prepared.sha256 || ''))) {
+    throw permanentArchiveError_('Prepared archive evidence is invalid.');
+  }
+  return prepared.sha256 + extension;
+}
+
+function createOrReusePreparedArchive_(prepared, config) {
+  const fileName = canonicalArchiveFileName_(prepared);
+  const folder = DriveApp.getFolderById(config.driveFolderId);
+  const downloaded = prepared.blob.setName(fileName);
   const existing = folder.getFilesByName(fileName);
   const matches = [];
   while (existing.hasNext() && matches.length < 2) matches.push(existing.next());
@@ -417,13 +435,13 @@ function storePhoto_(photo, message, recordId, config) {
     duplicateError.archivePermanent = true;
     throw duplicateError;
   }
-  let file;
+  let file, created = false;
   if (matches.length === 1) {
     file = matches[0];
     const existingIntegrity = validateArchiveBlob_(file.getBlob());
-    if (existingIntegrity.sha256 !== integrity.sha256 ||
-        existingIntegrity.byteSize !== integrity.byteSize ||
-        existingIntegrity.mimeType !== integrity.mimeType) {
+    if (existingIntegrity.sha256 !== prepared.sha256 ||
+        existingIntegrity.byteSize !== prepared.byteSize ||
+        existingIntegrity.mimeType !== prepared.mimeType) {
       const conflictError = new Error(
         'Existing canonical Drive object conflicts with downloaded bytes.'
       );
@@ -432,16 +450,24 @@ function storePhoto_(photo, message, recordId, config) {
     }
   } else {
     file = folder.createFile(downloaded);
+    created = true;
   }
-  if (!file.getId() || Number(file.getSize()) !== integrity.byteSize) {
+  if (!file.getId() || Number(file.getSize()) !== prepared.byteSize) {
     throw new Error('Drive did not confirm the canonical archive byte size.');
+  }
+  if (created) {
+    const confirmed = validateArchiveBlob_(file.getBlob());
+    if (confirmed.sha256 !== prepared.sha256 || confirmed.byteSize !== prepared.byteSize ||
+        confirmed.mimeType !== prepared.mimeType) {
+      throw permanentArchiveError_('Created canonical Drive object failed integrity readback.');
+    }
   }
   return {
     id: file.getId(),
     url: file.getUrl(),
-    mimeType: integrity.mimeType,
-    byteSize: integrity.byteSize,
-    sha256: integrity.sha256,
+    mimeType: prepared.mimeType,
+    byteSize: prepared.byteSize,
+    sha256: prepared.sha256,
     completedAtUtc: new Date().toISOString()
   };
 }
@@ -1502,7 +1528,7 @@ function claimGeminiPilotRows_(records, embeddings, config, limit) {
     config.recordIds.some(function (recordId) {
       if (claims.length >= limit) return true;
       const record = recordsById[recordId];
-      if (!record || !archiveRowIsReady_(record)) return false;
+      if (!record || !canonicalRowIsOwner_(record) || !archiveRowIsReady_(record)) return false;
       const key = recordId + '\n' + config.model;
       const current = latest[key];
       if (current && String(current.values[8]) === 'READY' &&
@@ -2026,7 +2052,7 @@ function queueExistingPhotosForTagging() {
     values.forEach(function (row) {
       const status = String(row[16] || '');
       if (
-        archiveRowIsReady_(row) &&
+        canonicalRowIsOwner_(row) && archiveRowIsReady_(row) &&
         !row[19] &&
         !row[20] &&
         (status === '' || status === 'SAVED')
@@ -2212,7 +2238,7 @@ function claimPendingPublications_(sheet, groups, limit) {
         sheet.getRange(index + 2, 1, 1, RECORD_HEADERS.length).setValues([row]);
         return;
       }
-      const caption = recordPublishCaption_(row);
+      const caption = recordPublishCaption_(row, values);
       const claimId = Utilities.getUuid();
       const claimedAttempts = attempts + 1;
       row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISHING';
@@ -2265,7 +2291,7 @@ function isClaimablePublicationRow_(row, groups, now) {
 }
 
 function publicationRowBoundaryError_(row, groups) {
-  if (!archiveRowIsReady_(row) || !row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] ||
+  if (!canonicalRowIsOwner_(row) || !archiveRowIsReady_(row) || !row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] ||
       !(String(row[RECORD_FIELD.ADMITTED_GROUP_ID] || '') === String(row[1]) ||
         String(row[1]) === groups.inputChatId) ||
       String(row[RECORD_FIELD.OUTPUT_CHAT_ID]) !== groups.outputChatId ||
@@ -2472,6 +2498,34 @@ function finishPublishClaim_(sheet, claim, result) {
       row[RECORD_FIELD.PUBLISHED_AT_UTC] = new Date().toISOString();
     }
     sheet.getRange(claim.rowNumber, 1, 1, RECORD_HEADERS.length).setValues([row]);
+    if (result.status === 'PUBLISHED') {
+      try {
+        const rows = sheet.getLastRow() > 1 ? sheet.getRange(
+          2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length
+        ).getValues() : [row];
+        const latest = recordPublishCaption_(row, rows);
+        if (latest !== claim.caption) {
+          row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+          row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
+          row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+          sheet.getRange(claim.rowNumber, 1, 1, RECORD_HEADERS.length).setValues([row]);
+        } else {
+          row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNCED';
+          row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
+          row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+          row[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID] = '';
+          row[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] = '';
+          row[RECORD_FIELD.CAPTION_SYNC_ERROR] = '';
+          row[RECORD_FIELD.PUBLISH_CAPTION] = claim.caption;
+          sheet.getRange(claim.rowNumber, 1, 1, RECORD_HEADERS.length).setValues([row]);
+        }
+      } catch (projectionFailure) {
+        row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+        row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
+        row[RECORD_FIELD.CAPTION_SYNC_ERROR] = 'Caption projection requires retry.';
+        sheet.getRange(claim.rowNumber, 1, 1, RECORD_HEADERS.length).setValues([row]);
+      }
+    }
     return true;
   } finally {
     lock.releaseLock();
@@ -2494,6 +2548,7 @@ function claimPendingTags_(config, limit) {
     const claims = [];
     for (let index = 0; index < values.length && claims.length < limit; index++) {
       const row = values[index];
+      if (!canonicalRowIsOwner_(row)) continue;
       if (!groqRowIsInsideActivationScope_(row, activation)) continue;
       const status = String(row[16] || '');
       const nextAttempt = row[22] ? new Date(row[22]) : null;
@@ -2574,7 +2629,7 @@ function revalidateTagClaim_(config, claim) {
     if (String(row[16]) !== 'TAGGING' || Number(row[21]) !== claim.attempts ||
         (claim.claimId && (row[RECORD_FIELD.TAG_CLAIM_ID] !== claim.claimId ||
           new Date(row[22]).getTime() <= Date.now())) ||
-        !archiveEvidenceMatchesRow_(claim, row)) {
+        !canonicalRowIsOwner_(row) || !archiveEvidenceMatchesRow_(claim, row)) {
       throw new Error('Groq claim or canonical archive changed before analysis.');
     }
     return true;
@@ -2593,7 +2648,7 @@ function finishTagClaim_(config, claim, result) {
     const current = sheet.getRange(
       rowNumber, 1, 1, RECORD_HEADERS.length
     ).getValues()[0];
-    if (!archiveEvidenceMatchesRow_(claim, current) ||
+    if (!canonicalRowIsOwner_(current) || !archiveEvidenceMatchesRow_(claim, current) ||
         String(current[16]) !== 'TAGGING' || Number(current[21]) !== claim.attempts ||
         (claim.claimId && (current[RECORD_FIELD.TAG_CLAIM_ID] !== claim.claimId ||
           new Date(current[22]).getTime() <= Date.now()))) {
@@ -2726,7 +2781,7 @@ function assertBlobMatchesArchive_(blob, archiveEvidence) {
   if (!archiveEvidence || actual.byteSize !== Number(archiveEvidence.archiveByteSize) ||
       actual.sha256 !== String(archiveEvidence.archiveSha256 || '') ||
       actual.mimeType !== String(archiveEvidence.archiveMimeType || '')) {
-    throw new Error('Canonical Drive object no longer matches recorded archive integrity.');
+    throw permanentArchiveError_('Canonical Drive object no longer matches recorded archive integrity.');
   }
   return actual;
 }
@@ -2762,7 +2817,7 @@ function assertDriveArchiveEvidence_(evidence) {
   if (!evidence || !evidence.driveFileId) throw new Error('Canonical Drive object is missing.');
   const file = DriveApp.getFileById(String(evidence.driveFileId));
   if (typeof file.isTrashed === 'function' && file.isTrashed()) {
-    throw new Error('Canonical Drive object is trashed.');
+    throw permanentArchiveError_('Canonical Drive object is trashed.');
   }
   const blob = file.getBlob();
   assertBlobMatchesArchive_(blob, evidence);
@@ -3205,9 +3260,21 @@ function rankRecordValues_(values, query, limit, allowLegacyUnverified) {
   const tokens = meaningfulQueryTokens_(query);
   if (!tokens.length) return [];
 
-  return values.map(function (row) {
-    if (!recordSearchIsAllowed_(row, allowLegacyUnverified)) return null;
-    const context = [row[9], row[10], row[RECORD_FIELD.ADJACENT_AFTER_TEXT]].map(readSheetText_).filter(Boolean).join(' · ');
+  const groups = {};
+  values.forEach(function (row) {
+    if (!recordSearchIsAllowed_(row, allowLegacyUnverified)) return;
+    const id = canonicalRecordId_(row);
+    if (!groups[id]) groups[id] = [];
+    groups[id].push(row);
+  });
+  return Object.keys(groups).map(function (id) {
+    const linked = groups[id];
+    const row = linked.filter(function (candidate) {
+      return String(candidate[0]) === id && canonicalRowIsOwner_(candidate);
+    })[0] || linked[0];
+    if (!canonicalRowIsOwner_(row)) return null;
+    const fragments = canonicalHumanFragments_(linked, row);
+    const context = fragments.join(' · ');
     const manualTags = readSheetText_(row[18]);
     const aiTags = readSheetText_(row[19]);
     const aiCaption = readSheetText_(row[20]);
@@ -3238,6 +3305,14 @@ function rankRecordValues_(values, query, limit, allowLegacyUnverified) {
         ? Math.max(best, field.weight)
         : best;
     }, 0);
+    const matching = fragments.filter(function (fragment) {
+      const normalized = normalizeSearchText_(fragment);
+      return tokens.some(function (token) { return normalized.split(' ').indexOf(token) !== -1; }) ||
+        normalized.indexOf(normalizedQuery) !== -1;
+    });
+    const projected = matching.concat(fragments.filter(function (fragment) {
+      return matching.indexOf(fragment) === -1;
+    })).concat(aiCaption ? [aiCaption] : []);
     return {
       fileId: String(row[11]),
       driveFileId: String(row[13] || ''),
@@ -3247,8 +3322,8 @@ function rankRecordValues_(values, query, limit, allowLegacyUnverified) {
       archiveCompletedAtUtc: String(row[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC] || ''),
       legacyUnverified: !archiveRowIsReady_(row),
       recordId: String(row[0]),
-      caption: (aiCaption || context || 'Matched record ' + row[0]).slice(0, 700),
-      tags: [manualTags, aiTags].filter(Boolean).join(', ').slice(0, 200),
+      caption: boundedCodePoints_(projected.join(' · ') || 'Matched record ' + row[0], 700),
+      tags: boundedCodePoints_([manualTags, aiTags].filter(Boolean).join(', '), 200),
       matchedTerms: matches,
       totalTerms: tokens.length,
       score: termScores.reduce(function (sum, value) { return sum + value; }, 0) +
@@ -3257,7 +3332,7 @@ function rankRecordValues_(values, query, limit, allowLegacyUnverified) {
   }).filter(Boolean).sort(function (left, right) {
     return right.matchedTerms - left.matchedTerms ||
       right.score - left.score ||
-      left.recordId.localeCompare(right.recordId);
+      codeUnitCompare_(left.recordId, right.recordId);
   }).slice(0, limit);
 }
 
@@ -3372,7 +3447,7 @@ function fuseHybridResults_(lexicalResults, semanticResults, limit) {
     return right.hybridScore - left.hybridScore ||
       right.lexicalRankScore - left.lexicalRankScore ||
       right.semanticRankScore - left.semanticRankScore ||
-      left.recordId.localeCompare(right.recordId);
+      codeUnitCompare_(left.recordId, right.recordId);
   }).slice(0, limit);
 }
 
@@ -3383,7 +3458,8 @@ function rankSemanticRows_(embeddingRows, recordRows, queryVector, config, limit
   return eligibleSemanticRows_(embeddingRows, recordRows, config, now).map(function (candidate) {
     const record = candidate.record;
     const recordId = candidate.recordId;
-    const context = [record[9], record[10]].map(readSheetText_).filter(Boolean).join(' · ');
+    const linked = canonicalGroupRows_(recordRows, record);
+    const context = canonicalHumanFragments_(linked, record).join(' · ');
     const manualTags = readSheetText_(record[18]);
     const aiTags = readSheetText_(record[19]);
     const aiCaption = readSheetText_(record[20]);
@@ -3397,15 +3473,15 @@ function rankSemanticRows_(embeddingRows, recordRows, queryVector, config, limit
         record[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC] || ''
       ),
       recordId: recordId,
-      caption: (aiCaption || context || 'Matched record ' + recordId).slice(0, 700),
-      tags: [manualTags, aiTags].filter(Boolean).join(', ').slice(0, 200),
+      caption: boundedCodePoints_([context, aiCaption].filter(Boolean).join(' · ') || 'Matched record ' + recordId, 700),
+      tags: boundedCodePoints_([manualTags, aiTags].filter(Boolean).join(', '), 200),
       semanticScore: cosineSimilarity_(query, candidate.vector)
     };
   }).filter(function (result) {
     return isFinite(result.semanticScore);
   }).sort(function (left, right) {
     return right.semanticScore - left.semanticScore ||
-      left.recordId.localeCompare(right.recordId);
+      codeUnitCompare_(left.recordId, right.recordId);
   }).slice(0, limit);
 }
 
@@ -3424,7 +3500,7 @@ function eligibleSemanticRows_(embeddingRows, recordRows, config, now) {
     const embedding = latest[key].values;
     const recordId = String(embedding[0]);
     const record = records[recordId];
-    if (!record || counts[recordId] !== 1 || !archiveRowIsReady_(record) || !record[11] ||
+    if (!record || counts[recordId] !== 1 || !canonicalRowIsOwner_(record) || !archiveRowIsReady_(record) || !record[11] ||
         !config.recordIdSet.has(recordId) ||
         String(embedding[8]) !== 'READY' || String(embedding[5]) !== config.model ||
         Number(embedding[6]) !== config.dimensions || !embeddingApprovalMatches_(embedding, config) ||
@@ -3497,7 +3573,7 @@ function sendSearchPhoto_(chatId, result, index, total, config) {
 
 function searchResultCaption_(result, index, total) {
   const hybrid = result.searchMode === 'Hybrid pilot';
-  return [
+  const caption = [
     hybrid
       ? String(index + 1) + '/' + total + ' · Hybrid pilot · rank ' +
         Number(result.hybridScore).toFixed(3)
@@ -3505,7 +3581,8 @@ function searchResultCaption_(result, index, total) {
         result.matchedTerms + '/' + result.totalTerms + ' query terms',
     result.tags ? 'Tags: ' + result.tags : '',
     result.caption
-  ].filter(Boolean).join('\n').slice(0, 1000);
+  ].filter(Boolean).join('\n');
+  return boundedCodePoints_(caption, 1000);
 }
 
 function searchRecords_(sheet, query, limit) {
@@ -3523,13 +3600,18 @@ function searchRecords_(sheet, query, limit) {
 
 function searchPublishedGroupRecords_(sheet, query, limit, config) {
   if (sheet.getLastRow() < 2) return [];
-  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length)
-    .getValues().filter(function (row) {
-      return String(row[RECORD_FIELD.PUBLISH_STATUS]) === 'PUBLISHED' &&
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues();
+  const eligible = {};
+  rows.forEach(function (row) {
+    if (canonicalRowIsOwner_(row) && String(row[RECORD_FIELD.PUBLISH_STATUS]) === 'PUBLISHED' &&
         String(row[RECORD_FIELD.OUTPUT_CHAT_ID]) === config.outputChatId &&
-        /^[1-9]\d*$/.test(String(row[RECORD_FIELD.OUTPUT_MESSAGE_ID] || ''));
-    });
-  return rankRecordValues_(rows, query, limit, false);
+        /^[1-9]\d*$/.test(String(row[RECORD_FIELD.OUTPUT_MESSAGE_ID] || ''))) {
+      eligible[String(row[0])] = true;
+    }
+  });
+  return rankRecordValues_(rows.filter(function (row) {
+    return Boolean(eligible[canonicalRecordId_(row)]);
+  }), query, limit, false);
 }
 
 function privateCommand_(message) {
@@ -4567,14 +4649,16 @@ function captionVersion_(message, update) {
     String(Number(update.update_id || 0)).padStart(16, '0');
 }
 
-function applyCaptionVersion_(row, caption, version) {
+function applyCaptionVersion_(row, caption, version, suppressSync) {
   if (String(row[RECORD_FIELD.CAPTION_VERSION] || '') >= version) return false;
   if (!row[RECORD_FIELD.CAPTION_VERSION]) row[RECORD_FIELD.ORIGINAL_CAPTION] = row[10] || '';
   row[10] = sheetText_(String(caption || ''));
   row[RECORD_FIELD.LATEST_CAPTION] = row[10]; row[RECORD_FIELD.CAPTION_VERSION] = version;
-  row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
-  row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
-  row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+  if (!suppressSync) {
+    row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+    row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
+    row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+  }
   return true;
 }
 
@@ -4594,19 +4678,68 @@ function processCaptionEdit_(update, message, records, events) {
   const id = makeRecordId_(message), number = findRecordRow_(records, id);
   const edit = { caption: String(message.caption || ''), version: captionVersion_(message, update) };
   if (number) {
-    const row = records.getRange(number, 1, 1, RECORD_HEADERS.length).getValues()[0];
-    if (!applyCaptionVersion_(row, edit.caption, edit.version)) return 'stale';
+    const values = records.getRange(2, 1, records.getLastRow() - 1, RECORD_HEADERS.length).getValues();
+    const row = values[number - 2];
+    const before = canonicalHumanFragments_(values, row).join(' · ');
+    if (!applyCaptionVersion_(row, edit.caption, edit.version, true)) return 'stale';
+    if (!canonicalRowIsOwner_(row)) row[RECORD_FIELD.CAPTION_SYNC_STATUS] = '';
+    values[number - 2] = row;
     records.getRange(number, 1, 1, RECORD_HEADERS.length).setValues([row]);
+    queueCanonicalCaptionSync_(records, values, row, before);
   }
   appendEvent_(events, update, message, 'caption-edit', sheetText_(JSON.stringify(edit)), id);
   return number ? 'caption-updated' : 'caption-pending';
 }
 
-function recordPublishCaption_(row) {
-  const human = [row[10], row[18], row[9], row[RECORD_FIELD.ADJACENT_AFTER_TEXT]]
-    .map(readSheetText_).filter(Boolean).join(' · ');
+function queueCanonicalCaptionSync_(records, rows, changedRow, previousAggregate) {
+  const ownerId = canonicalRecordId_(changedRow);
+  const ownerIndex = rows.findIndex(function (row) { return String(row[0]) === ownerId; });
+  if (ownerIndex < 0) return false;
+  const owner = rows[ownerIndex];
+  const nextAggregate = canonicalHumanFragments_(rows, owner).join(' · ');
+  if (normalizedCaptionKey_(previousAggregate) === normalizedCaptionKey_(nextAggregate)) return false;
+  if (String(owner[RECORD_FIELD.CAPTION_SYNC_STATUS]) !== 'SYNCING') {
+    owner[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+    owner[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
+    owner[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+    owner[RECORD_FIELD.CAPTION_SYNC_ERROR] = '';
+    records.getRange(ownerIndex + 2, 1, 1, RECORD_HEADERS.length).setValues([owner]);
+  }
+  return true;
+}
+
+function normalizedCaptionKey_(value) {
+  return stripLoneSurrogates_(readSheetText_(value)).normalize('NFKC').replace(/\s+/g, ' ').trim();
+}
+
+function canonicalGroupRows_(rows, row) {
+  const id = canonicalRecordId_(row);
+  return (rows || [row]).filter(function (candidate) {
+    return canonicalRecordId_(candidate) === id;
+  });
+}
+
+function canonicalHumanFragments_(rows, row) {
+  const seen = new Set(), fragments = [];
+  canonicalGroupRows_(rows, row).forEach(function (linked) {
+    [linked[RECORD_FIELD.LATEST_CAPTION] || linked[10], linked[9],
+      linked[RECORD_FIELD.ADJACENT_AFTER_TEXT]].forEach(function (value) {
+      const verbatim = readSheetText_(value), key = normalizedCaptionKey_(verbatim);
+      if (key && !seen.has(key)) { seen.add(key); fragments.push(verbatim); }
+    });
+  });
+  return fragments;
+}
+
+function boundedCodePoints_(value, limit) {
+  return Array.from(stripLoneSurrogates_(String(value || ''))).slice(0, limit).join('');
+}
+
+function recordPublishCaption_(row, rows) {
+  const human = canonicalHumanFragments_(rows, row).concat([readSheetText_(row[18])])
+    .filter(Boolean).join(' · ');
   if (String(row[16]) === 'TAG_UNAVAILABLE') {
-    return (Array.from(stripLoneSurrogates_(human)).slice(0, 900).join('') + '\nAnalysis unavailable.').trim();
+    return (boundedCodePoints_(human, 900) + '\nAnalysis unavailable.').trim();
   }
   return buildPublishCaption_(row[RECORD_FIELD.AI_METADATA_JSON], human);
 }
@@ -4657,6 +4790,62 @@ function catalogHealth() {
   });
 }
 
+function historicalDuplicateCandidateReportFromRows_(rows) {
+  const groups = {};
+  (rows || []).forEach(function (row) {
+    if (!archiveRowIsReady_(row)) return;
+    const digest = String(row[RECORD_FIELD.ARCHIVE_SHA256] || '');
+    if (!groups[digest]) groups[digest] = [];
+    groups[digest].push(row);
+  });
+  return Object.keys(groups).sort(codeUnitCompare_).map(function (digest) {
+    const group = groups[digest];
+    if (group.length < 2) return null;
+    const owners = group.filter(function (row) {
+      return String(row[RECORD_FIELD.CANONICAL_ROLE]) === 'OWNER' &&
+        canonicalRecordId_(row) === String(row[0]);
+    });
+    let resolved = owners.length === 1;
+    const ownerId = resolved ? String(owners[0][0]) : '';
+    const sourceId = resolved ? String(owners[0][RECORD_FIELD.ARCHIVE_SOURCE_RECORD_ID] || '') : '';
+    const evidence = resolved ? [owners[0][13], owners[0][RECORD_FIELD.ARCHIVE_MIME_TYPE],
+      owners[0][RECORD_FIELD.ARCHIVE_BYTE_SIZE], owners[0][RECORD_FIELD.ARCHIVE_SHA256]]
+      .map(String).join('|') : '';
+    if (resolved) resolved = group.every(function (row) {
+      const current = [row[13], row[RECORD_FIELD.ARCHIVE_MIME_TYPE],
+        row[RECORD_FIELD.ARCHIVE_BYTE_SIZE], row[RECORD_FIELD.ARCHIVE_SHA256]]
+        .map(String).join('|');
+      return canonicalRecordId_(row) === ownerId &&
+        ['OWNER', 'ALIAS'].indexOf(String(row[RECORD_FIELD.CANONICAL_ROLE])) !== -1 &&
+        Boolean(row[RECORD_FIELD.CANONICAL_LINKED_AT_UTC]) &&
+        String(row[RECORD_FIELD.ARCHIVE_SOURCE_RECORD_ID] || '') === sourceId &&
+        current === evidence;
+    });
+    if (resolved && sourceId) {
+      const source = group.filter(function (row) { return String(row[0]) === sourceId; })[0];
+      resolved = Boolean(source) && [source[13], source[RECORD_FIELD.ARCHIVE_MIME_TYPE],
+        source[RECORD_FIELD.ARCHIVE_BYTE_SIZE], source[RECORD_FIELD.ARCHIVE_SHA256]]
+        .map(String).join('|') === evidence;
+    } else {
+      resolved = false;
+    }
+    if (resolved) return null;
+    return { sha256: digest, recordIds: group.map(function (row) { return String(row[0]); })
+      .sort(codeUnitCompare_), evidence: 'LEDGER_READY_OBJECT_UNVERIFIED' };
+  }).filter(Boolean);
+}
+
+function reportHistoricalDuplicateCandidates() {
+  const config = getConfig_(false);
+  const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
+  const rows = sheet && sheet.getLastRow() > 1 ? sheet.getRange(
+    2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length
+  ).getValues() : [];
+  const report = historicalDuplicateCandidateReportFromRows_(rows);
+  console.log(JSON.stringify(report));
+  return report;
+}
+
 // Explicit archive-only repair: historical rows never receive intake/publication admission.
 function recoverHistoricalArchive(recordId) {
   const config = getConfig_(false), book = SpreadsheetApp.openById(config.spreadsheetId);
@@ -4678,35 +4867,43 @@ function recoverHistoricalArchive(recordId) {
         original[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC] || original[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID]) {
       throw new Error('Record is admitted, published or claimed; historical repair refused.');
     }
+    if (archiveRowIsReady_(original) && original[16] === 'TAG_NOT_ELIGIBLE') {
+      try {
+        assertDriveArchiveRow_(original);
+        return {recordId: recordId, status: 'ALREADY_VERIFIED'};
+      } catch (verificationFailure) {
+        if (!canonicalCandidateIsSkippable_(verificationFailure)) throw verificationFailure;
+      }
+    }
     claimed = original.slice(); claimed[RECORD_FIELD.ARCHIVE_CLAIM_ID] = claim;
     // Manual claims require explicit operator inspection after interruption; workers cannot consume them.
     sheet.getRange(number,1,1,RECORD_HEADERS.length).setValues([claimed]);
   } finally { lock.releaseLock(); }
   try {
-    let stored, file, blob;
+    let prepared, stored, file, blob;
     if (original[13]) {
       try { file = DriveApp.getFileById(String(original[13])); if (!file.isTrashed()) blob = file.getBlob(); }
       catch (unavailable) { file = null; }
     }
     if (blob) {
       const integrity = validateArchiveBlob_(blob);
-      stored = {id: original[13], url: original[14], mimeType: integrity.mimeType,
-        byteSize: integrity.byteSize, sha256: integrity.sha256, completedAtUtc: new Date().toISOString()};
+      prepared = {blob: blob, mimeType: integrity.mimeType,
+        byteSize: integrity.byteSize, sha256: integrity.sha256};
     } else {
       // Collector v1 wrote UTC instants without fractional seconds.
       const sentAt = canonicalIsoInstant_(String(original[3]).replace(/(:\d{2})Z$/, '$1.000Z'));
       if (!original[11] || !sentAt) throw new Error('No usable historical source.');
-      stored = storePhoto_({file_id: String(original[11])},
-        {date: Date.parse(sentAt)/1000}, recordId, config);
+      prepared = prepareCanonicalPhoto_({file_id: String(original[11])}, config);
     }
-    [[RECORD_FIELD.ARCHIVE_MIME_TYPE,stored.mimeType], [RECORD_FIELD.ARCHIVE_BYTE_SIZE,stored.byteSize],
-      [RECORD_FIELD.ARCHIVE_SHA256,stored.sha256]].forEach(function(pair) {
+    [[RECORD_FIELD.ARCHIVE_MIME_TYPE,prepared.mimeType], [RECORD_FIELD.ARCHIVE_BYTE_SIZE,prepared.byteSize],
+      [RECORD_FIELD.ARCHIVE_SHA256,prepared.sha256]].forEach(function(pair) {
       if (original[pair[0]] !== '' && String(original[pair[0]]) !== String(pair[1])) throw new Error('Historical integrity evidence conflicts.');
     });
     if (!lock.tryLock(10000)) throw new Error('Catalog is busy.');
     try {
       const current = sheet.getRange(number,1,1,RECORD_HEADERS.length).getValues()[0];
       if (JSON.stringify(current) !== JSON.stringify(claimed)) throw new Error('Historical record changed during repair.');
+      stored = createOrReusePreparedArchive_(prepared, config);
       if (archiveRowIsReady_(original) && original[16] === 'TAG_NOT_ELIGIBLE' && stored.id === original[13]) {
         current[RECORD_FIELD.ARCHIVE_CLAIM_ID]='';
         sheet.getRange(number,1,1,RECORD_HEADERS.length).setValues([current]);
@@ -4773,6 +4970,163 @@ function refundPublicationAttempt_(sheet, claim) {
   } finally { lock.releaseLock(); }
 }
 
+function canonicalRecordId_(row) {
+  return String(row && row[RECORD_FIELD.CANONICAL_RECORD_ID] || row && row[0] || '');
+}
+
+function canonicalRowIsOwner_(row) {
+  const role = String(row && row[RECORD_FIELD.CANONICAL_ROLE] || '');
+  return (!role && !row[RECORD_FIELD.CANONICAL_RECORD_ID]) ||
+    (role === 'OWNER' && canonicalRecordId_(row) === String(row[0]));
+}
+
+function canonicalCandidateIsSkippable_(error) {
+  return Boolean(error && error.archivePermanent);
+}
+
+function codeUnitCompare_(left, right) {
+  left = String(left); right = String(right);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function commitCanonicalArchive_(sheet, claim, prepared, config) {
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues();
+  const currentIndex = claim.number - 2;
+  const current = rows[currentIndex];
+  if (!current || current[RECORD_FIELD.ARCHIVE_CLAIM_ID] !== claim.id ||
+      current[RECORD_FIELD.ARCHIVE_STATUS] !== 'ARCHIVING') return false;
+
+  const sameDigest = rows.map(function (row, index) { return { row: row, index: index }; })
+    .filter(function (entry) {
+      return entry.index !== currentIndex && archiveRowIsReady_(entry.row) &&
+        String(entry.row[RECORD_FIELD.ARCHIVE_SHA256]) === prepared.sha256;
+    });
+  sameDigest.forEach(function (entry) {
+    if (Number(entry.row[RECORD_FIELD.ARCHIVE_BYTE_SIZE]) !== prepared.byteSize ||
+        String(entry.row[RECORD_FIELD.ARCHIVE_MIME_TYPE]) !== prepared.mimeType) {
+      throw permanentArchiveError_('Same-digest archive ledger evidence conflicts.');
+    }
+  });
+
+  const probes = {}, candidates = [];
+  sameDigest.forEach(function (entry) {
+    const evidence = archiveEvidenceFromRow_(entry.row);
+    const key = [evidence.driveFileId, evidence.archiveMimeType, evidence.archiveByteSize,
+      evidence.archiveSha256].join('|');
+    if (!probes[key]) { probes[key] = entry; candidates.push(entry); }
+  });
+  candidates.sort(function (left, right) {
+    const leftOwner = String(left.row[RECORD_FIELD.CANONICAL_ROLE]) === 'OWNER' &&
+      canonicalRecordId_(left.row) === String(left.row[0]) ? 0 :
+      left.row[RECORD_FIELD.CANONICAL_RECORD_ID] ? 1 : 2;
+    const rightOwner = String(right.row[RECORD_FIELD.CANONICAL_ROLE]) === 'OWNER' &&
+      canonicalRecordId_(right.row) === String(right.row[0]) ? 0 :
+      right.row[RECORD_FIELD.CANONICAL_RECORD_ID] ? 1 : 2;
+    return leftOwner - rightOwner || codeUnitCompare_(left.row[0], right.row[0]);
+  });
+
+  let source = null, stored = null;
+  for (let i = 0; i < candidates.length && !source; i++) {
+    try {
+      assertDriveArchiveRow_(candidates[i].row);
+      source = candidates[i];
+      stored = { id: String(source.row[13]), url: String(source.row[14]),
+        mimeType: prepared.mimeType, byteSize: prepared.byteSize, sha256: prepared.sha256,
+        completedAtUtc: String(source.row[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC]) };
+    } catch (error) {
+      if (!canonicalCandidateIsSkippable_(error)) throw error;
+    }
+  }
+  if (!stored) stored = createOrReusePreparedArchive_(prepared, config);
+
+  let ownerId = '';
+  sameDigest.some(function (entry) {
+    if (String(entry.row[RECORD_FIELD.CANONICAL_ROLE]) === 'OWNER' &&
+        canonicalRecordId_(entry.row) === String(entry.row[0])) {
+      ownerId = String(entry.row[0]); return true;
+    }
+    return false;
+  });
+  const existingOwner = sameDigest.filter(function (entry) { return String(entry.row[0]) === ownerId; })[0];
+  if (!ownerId || (current[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] && existingOwner &&
+      !existingOwner.row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC])) ownerId = String(current[0]);
+  const archiveSourceRecordId = String(
+    existingOwner && existingOwner.row[RECORD_FIELD.ARCHIVE_SOURCE_RECORD_ID] ||
+    source && source.row[RECORD_FIELD.ARCHIVE_SOURCE_RECORD_ID] ||
+    source && source.row[0] || ownerId
+  );
+
+  const linkedAt = new Date().toISOString();
+  const participants = sameDigest.filter(function (entry) {
+    return Boolean(entry.row[RECORD_FIELD.CANONICAL_RECORD_ID]);
+  });
+  const priorOwner = participants.filter(function (entry) { return String(entry.row[0]) === ownerId; })[0];
+  const previousAggregate = priorOwner ? canonicalHumanFragments_(participants.map(function (entry) {
+    return entry.row;
+  }), priorOwner.row).join(' · ') : '';
+  participants.push({ row: current, index: currentIndex });
+  const seen = {};
+  participants.forEach(function (entry) {
+    if (seen[entry.index]) return; seen[entry.index] = true;
+    const row = entry.row.slice();
+    row[13] = stored.id; row[14] = stored.url;
+    row[RECORD_FIELD.ARCHIVE_MIME_TYPE] = stored.mimeType;
+    row[RECORD_FIELD.ARCHIVE_BYTE_SIZE] = stored.byteSize;
+    row[RECORD_FIELD.ARCHIVE_SHA256] = stored.sha256;
+    row[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC] = stored.completedAtUtc;
+    row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVED'; row[RECORD_FIELD.ARCHIVE_ERROR] = '';
+    row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC] = '';
+    const role = String(row[0]) === ownerId ? 'OWNER' : 'ALIAS';
+    const relationshipChanged = canonicalRecordId_(row) !== ownerId ||
+      String(row[RECORD_FIELD.CANONICAL_ROLE] || '') !== role;
+    row[RECORD_FIELD.CANONICAL_RECORD_ID] = ownerId;
+    row[RECORD_FIELD.CANONICAL_ROLE] = role;
+    if (relationshipChanged || !row[RECORD_FIELD.CANONICAL_LINKED_AT_UTC]) {
+      row[RECORD_FIELD.CANONICAL_LINKED_AT_UTC] = linkedAt;
+    }
+    if (relationshipChanged || !row[RECORD_FIELD.ARCHIVE_SOURCE_RECORD_ID]) {
+      row[RECORD_FIELD.ARCHIVE_SOURCE_RECORD_ID] = archiveSourceRecordId;
+    }
+    if (String(row[0]) !== ownerId) {
+      row[16] = 'TAG_NOT_ELIGIBLE'; row[RECORD_FIELD.TAG_CLAIM_ID] = '';
+      row[RECORD_FIELD.PUBLISH_STATUS] = 'PUBLISH_NOT_ELIGIBLE';
+      row[RECORD_FIELD.CAPTION_SYNC_STATUS] = '';
+    } else if (entry.index === currentIndex) {
+      row[16] = row[RECORD_FIELD.ANALYSIS_ADMITTED_AT_UTC] ? 'TAG_PENDING' : 'TAG_NOT_ELIGIBLE';
+    }
+    if (entry.index === currentIndex) {
+      row[RECORD_FIELD.ARCHIVE_CLAIM_ID] = ''; row[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC] = '';
+    }
+    rows[entry.index] = row;
+  });
+  const ownerEntry = participants.filter(function (entry) { return String(entry.row[0]) === ownerId; })[0];
+  if (ownerEntry) {
+    const ownerRow = rows[ownerEntry.index];
+    const nextAggregate = canonicalHumanFragments_(participants.map(function (entry) {
+      return rows[entry.index];
+    }), ownerRow).join(' · ');
+    if (ownerRow[RECORD_FIELD.OUTPUT_MESSAGE_ID] &&
+        normalizedCaptionKey_(previousAggregate) !== normalizedCaptionKey_(nextAggregate) &&
+        String(ownerRow[RECORD_FIELD.CAPTION_SYNC_STATUS]) !== 'SYNCING') {
+      ownerRow[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+      ownerRow[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = 0;
+      ownerRow[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
+      ownerRow[RECORD_FIELD.CAPTION_SYNC_ERROR] = '';
+    }
+  }
+  // Write dependent owner/relink state first. The current claim remains recoverable until the final write.
+  try {
+    participants.filter(function (entry) { return entry.index !== currentIndex; }).forEach(function (entry) {
+      sheet.getRange(entry.index + 2, 1, 1, RECORD_HEADERS.length).setValues([rows[entry.index]]);
+    });
+    sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length).setValues([rows[currentIndex]]);
+  } catch (writeFailure) {
+    writeFailure.canonicalCommitInterrupted = true;
+    throw writeFailure;
+  }
+  return true;
+}
+
 function processPendingArchives() {
   if (stageIsPaused_('archive')) return { processed: 0, paused: true };
   const config = getConfig_(false), sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
@@ -4800,16 +5154,36 @@ function processPendingArchives() {
     });
   } finally { lock.releaseLock(); }
   claims.forEach(function (claim) {
-    let stored, error;
+    let prepared, error;
     try {
       if (stageIsPaused_('archive')) { const paused = new Error('Stage paused.'); paused.stageAlreadyPaused = true; throw paused; }
       const message = JSON.parse(claim.row[RECORD_FIELD.INTAKE_JSON]);
-      stored = storePhoto_(largestPhoto_(message.photo), message, String(claim.row[0]), config);
+      prepared = prepareCanonicalPhoto_(largestPhoto_(message.photo), config);
     } catch (failure) { error = failure; }
     const saveLock = LockService.getScriptLock(); if (!saveLock.tryLock(10000)) return;
     try {
       const row = sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length).getValues()[0];
       if (row[RECORD_FIELD.ARCHIVE_CLAIM_ID] !== claim.id || row[RECORD_FIELD.ARCHIVE_STATUS] !== 'ARCHIVING') return;
+      if (!error) {
+        try { commitCanonicalArchive_(sheet, claim, prepared, config); return; }
+        catch (commitFailure) {
+          if (commitFailure.canonicalCommitInterrupted) {
+            const interrupted = sheet.getRange(
+              claim.number, 1, 1, RECORD_HEADERS.length
+            ).getValues()[0];
+            if (interrupted[RECORD_FIELD.ARCHIVE_CLAIM_ID] === claim.id &&
+                interrupted[RECORD_FIELD.ARCHIVE_STATUS] === 'ARCHIVING') {
+              interrupted[RECORD_FIELD.ARCHIVE_ATTEMPTS] = Math.max(
+                0, Number(interrupted[RECORD_FIELD.ARCHIVE_ATTEMPTS]) - 1
+              );
+              sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length)
+                .setValues([interrupted]);
+            }
+            return;
+          }
+          error = commitFailure;
+        }
+      }
       row[RECORD_FIELD.ARCHIVE_CLAIM_ID] = ''; row[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC] = '';
       if (error) {
         if (error.stageAlreadyPaused || pauseStageForError_('archive', error)) {
@@ -4823,16 +5197,6 @@ function processPendingArchives() {
           row[RECORD_FIELD.ARCHIVE_ERROR] = 'Archive attempt failed.';
         }
         row[16] = row[RECORD_FIELD.ARCHIVE_STATUS];
-      } else {
-        row[13] = stored.id; row[14] = stored.url;
-        row[RECORD_FIELD.ARCHIVE_MIME_TYPE] = stored.mimeType;
-        row[RECORD_FIELD.ARCHIVE_BYTE_SIZE] = stored.byteSize;
-        row[RECORD_FIELD.ARCHIVE_SHA256] = stored.sha256;
-        row[RECORD_FIELD.ARCHIVE_COMPLETED_AT_UTC] = stored.completedAtUtc;
-        row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVED'; row[RECORD_FIELD.ARCHIVE_ERROR] = '';
-        row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC] = '';
-        // Later activation never turns an ineligible receipt into work.
-        row[16] = row[RECORD_FIELD.ANALYSIS_ADMITTED_AT_UTC] ? 'TAG_PENDING' : 'TAG_NOT_ELIGIBLE';
       }
       sheet.getRange(claim.number, 1, 1, RECORD_HEADERS.length).setValues([row]);
     } finally { saveLock.releaseLock(); }
@@ -4846,7 +5210,7 @@ function requestCatalogEnrichment(recordId) {
   try {
     const n = findRecordRow_(sheet, recordId); if (!n) throw new Error('Record not found.');
     const row = sheet.getRange(n, 1, 1, RECORD_HEADERS.length).getValues()[0];
-    if (!archiveRowIsReady_(row) || row[16] !== 'TAG_UNAVAILABLE') throw new Error('Record is not eligible for explicit enrichment.');
+    if (!canonicalRowIsOwner_(row) || !archiveRowIsReady_(row) || row[16] !== 'TAG_UNAVAILABLE') throw new Error('Record is not eligible for explicit enrichment.');
     row[16] = 'TAG_PENDING'; row[21] = 0; row[22] = ''; row[17] = '';
     if (!row[RECORD_FIELD.OUTPUT_MESSAGE_ID] && row[RECORD_FIELD.PUBLISH_ELIGIBLE_AT_UTC] &&
         ['PUBLISH_PENDING', 'PUBLISH_RETRY'].indexOf(row[RECORD_FIELD.PUBLISH_STATUS]) !== -1) {
@@ -4864,10 +5228,11 @@ function processPendingCaptionSync() {
   if (!lock.tryLock(10000)) return { processed: 0 };
   try {
     if (!sheet || sheet.getLastRow() < 2) return { processed: 0 };
-    sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues().forEach(function (row, index) {
+    const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues();
+    values.forEach(function (row, index) {
       if (claims.length >= 2 || row[RECORD_FIELD.PUBLISH_STATUS] !== 'PUBLISHED' ||
           String(row[RECORD_FIELD.OUTPUT_CHAT_ID]) !== config.outputChatId || !row[RECORD_FIELD.OUTPUT_MESSAGE_ID] ||
-          !archiveRowIsReady_(row)) return;
+          !canonicalRowIsOwner_(row) || !archiveRowIsReady_(row)) return;
       const status = row[RECORD_FIELD.CAPTION_SYNC_STATUS];
       const deadline = status === 'SYNCING' ? row[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] : row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC];
       if (['SYNC_PENDING', 'SYNC_RETRY', 'SYNCING'].indexOf(status) === -1 ||
@@ -4878,7 +5243,7 @@ function processPendingCaptionSync() {
         row[RECORD_FIELD.CAPTION_SYNC_ERROR] = 'Maximum caption synchronization attempts reached.';
       }
       else {
-        const caption = recordPublishCaption_(row), id = Utilities.getUuid();
+        const caption = recordPublishCaption_(row, values), id = Utilities.getUuid();
         row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNCING'; row[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID] = id;
         row[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] = new Date(Date.now() + 600000).toISOString();
         row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = attempts + 1;
@@ -4908,10 +5273,10 @@ function processPendingCaptionSync() {
         }
         return;
       }
-      const changed = recordPublishCaption_(row) !== claim.caption;
+      const liveRows = sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues();
+      const changed = recordPublishCaption_(row, liveRows) !== claim.caption;
       row[RECORD_FIELD.CAPTION_SYNC_CLAIM_ID] = ''; row[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] = '';
-      if (changed) { row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING'; }
-      else if (error) {
+      if (error) {
         const paused = error.stageAlreadyPaused || pauseStageForError_('caption', error);
         row[RECORD_FIELD.CAPTION_SYNC_ERROR] = 'Caption synchronization failed' +
           (Number(error.httpStatus) ? ' (HTTP ' + Number(error.httpStatus) + ')' : '') + '.';
@@ -4920,6 +5285,10 @@ function processPendingCaptionSync() {
         if (paused) row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = Math.max(0, attempts - 1);
         row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = paused ? '' :
           new Date(Date.now() + Math.max(publishBackoffMinutes_(attempts) * 60000, Number(error.retryAfterSeconds || 0) * 1000)).toISOString();
+      } else if (changed) {
+        row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_PENDING';
+        row[RECORD_FIELD.CAPTION_SYNC_ERROR] = '';
+        row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC] = '';
       } else {
         row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNCED';
         row[RECORD_FIELD.CAPTION_SYNC_ERROR] = '';

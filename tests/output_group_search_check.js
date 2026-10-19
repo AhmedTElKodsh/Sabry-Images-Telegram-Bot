@@ -7,11 +7,12 @@ function fixture() {
   vm.createContext(s);
   vm.runInContext(source, s);
   const field = vm.runInContext('RECORD_FIELD', s);
+  const headers = vm.runInContext('RECORD_HEADERS', s);
   const config = { botToken: 'fixture', spreadsheetId: 'sheet', allowedChatId: '-1001',
     outputChatId: '-1002', botTokenFingerprint: 'f'.repeat(64), searchUserIds: [],
     outputGroupsVerifiedFor: 'v2|-1001|-1002|' + 'f'.repeat(64) };
   function row(id, changes = {}) {
-    const r = new Array(45).fill('');
+    const r = new Array(headers.length).fill('');
     r[0] = id; r[1] = '-1001'; r[10] = 'كتاب'; r[11] = 'photo-' + id; r[13] = 'drive-' + id;
     r[field.ARCHIVE_STATUS] = 'ARCHIVED'; r[field.ARCHIVE_MIME_TYPE] = 'image/jpeg';
     r[field.ARCHIVE_BYTE_SIZE] = 4; r[field.ARCHIVE_SHA256] = '01'.repeat(32);
@@ -110,4 +111,29 @@ assert.ok(f.sends.every(x => x.payload.chat_id === '42'));
 // More than five real matches still sends only the bounded result count.
 f = fixture(); for (let i = 0; i < 8; i++) f.rows.push(f.row('more-' + i));
 assert.strictEqual(f.run(), 'search-results'); assert.strictEqual(f.sends.length, 5);
+// Alias-only human text reaches the routed consumer, but the owner photo occupies one slot.
+f = fixture();
+f.rows[0][f.field.CANONICAL_RECORD_ID]='good';f.rows[0][f.field.CANONICAL_ROLE]='OWNER';
+const alias=f.row('alias',{PUBLISH_STATUS:'PUBLISH_NOT_ELIGIBLE',OUTPUT_MESSAGE_ID:''});
+alias[10]='unique alias phrase';alias[f.field.CANONICAL_RECORD_ID]='good';alias[f.field.CANONICAL_ROLE]='ALIAS';
+alias[13]=f.rows[0][13];f.rows.push(alias);
+assert.strictEqual(f.run({text:'/search unique alias'}),'search-results');
+assert.strictEqual(f.sends.length,1);assert.strictEqual(f.sends[0].payload.photo,'photo-good');
+
+// Full duplicate worker flow admits one downstream owner and delivers that owner once.
+const {runtime:catalogRuntime}=require('./catalog_fixture');const c=catalogRuntime();
+c.s.storePhoto_=()=>c.archive;
+c.s.processPhoto_({update_id:1},c.message,c.records,c.events,c.config);
+c.s.processPhoto_({update_id:2},{...c.message,message_id:11,caption:'worker alias only'},c.records,c.events,c.config);
+c.s.processPendingArchives();
+const owner=c.records.data[1],workerAlias=c.records.data[2];
+assert.strictEqual(c.s.claimPendingTags_(c.config,5).length,1);
+assert.strictEqual(workerAlias[16],'TAG_NOT_ELIGIBLE');
+owner[16]='TAG_UNAVAILABLE';owner[c.F.PUBLISH_STATUS]='PUBLISHED';owner[c.F.OUTPUT_CHAT_ID]='-2';
+owner[c.F.OUTPUT_MESSAGE_ID]='90';
+const workerResults=c.s.searchPublishedGroupRecords_(c.records,'worker alias',5,c.config);
+assert.strictEqual(workerResults.length,1);let downstream=0;
+c.s.telegram_=method=>{assert.strictEqual(method,'sendPhoto');downstream++;return{ok:true,result:{message_id:91}};};
+c.s.sendSearchPhoto_('-2',workerResults[0],0,workerResults.length,c.config);
+assert.strictEqual(downstream,1);assert.strictEqual(workerResults[0].recordId,owner[0]);
 console.log('PASS: output-group search routing, authorization, corpus and delivery checks');

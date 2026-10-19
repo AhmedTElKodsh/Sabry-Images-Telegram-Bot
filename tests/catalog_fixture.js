@@ -49,6 +49,15 @@ function runtime() {
     from:{id:42,is_bot:false}, caption:'original book', photo:[{file_id:'photo',file_unique_id:'unique',width:1,height:1}] };
   const archive = { id:'drive', url:'drive-url', mimeType:'image/jpeg', byteSize:4,
     sha256:require('crypto').createHash('sha256').update(Buffer.from([255,216,255,217])).digest('hex'), completedAtUtc:new Date().toISOString() };
-  return {s:state,F,H,props,records,events,groups,spreadsheet,config,message,archive,sheet,lock};
+  // Worker preparation is provider-free. Preserve older focused tests that replace storePhoto_
+  // while the production worker now creates/reuses the digest object only inside its save lock.
+  const productionStore = state.storePhoto_, productionCreate = state.createOrReusePreparedArchive_;
+  state.prepareCanonicalPhoto_ = (photo, config) => state.storePhoto_ !== productionStore
+    ? state.storePhoto_(photo, message, 'fixture-record', config)
+    : { blob:{setName(){return this;}}, mimeType:archive.mimeType,
+      byteSize:archive.byteSize, sha256:archive.sha256 };
+  state.createOrReusePreparedArchive_ = prepared => prepared && prepared.id ? prepared : archive;
+  return {s:state,F,H,props,records,events,groups,spreadsheet,config,message,archive,sheet,lock,
+    productionCreate};
 }
 module.exports = {runtime};
