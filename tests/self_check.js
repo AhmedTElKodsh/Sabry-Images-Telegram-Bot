@@ -11,7 +11,8 @@ if (sandbox.selfCheck() !== true) process.exitCode = 1;
 sandbox.Utilities = {
   DigestAlgorithm: { SHA_256: 'SHA_256' },
   computeDigest: () => new Array(32).fill(1),
-  formatDate: () => '20260831_120000'
+  formatDate: () => '20260831_120000',
+  getUuid: () => 'self-check-claim'
 };
 const validJpegBlob = {
   getBytes: () => [255, 216, 1, 2, 255, 217],
@@ -155,7 +156,8 @@ const originalProcessUpdate = sandbox.processUpdate_;
 let configuredWebhookSecret = webhookSecret;
 sandbox.getConfig_ = () => ({
   webhookSecret: configuredWebhookSecret,
-  allowedChatId: '-1004439324869'
+  allowedChatId: '-1004439324869',
+  spreadsheetId: 'self-check-sheet'
 });
 sandbox.HtmlService = {
   createHtmlOutput: (body) => ({ body })
@@ -165,6 +167,26 @@ sandbox.LockService = { getScriptLock: () => ({
   tryLock: (milliseconds) => milliseconds === 10000,
   releaseLock: () => { lockReleased = true; }
 }) };
+const inboxRows = [[
+  'update_id', 'payload_json', 'status', 'claim_id', 'lease_until_utc',
+  'attempts', 'last_error', 'received_at_utc', 'completed_at_utc'
+]];
+const inboxSheet = {
+  data: inboxRows,
+  getLastRow: () => inboxRows.length,
+  appendRow: row => inboxRows.push(Array.from(row)),
+  getRange: (r, c, n = 1, m = 1) => ({
+    getValues: () => Array.from({length: n}, (_, i) =>
+      Array.from({length: m}, (_, j) => inboxRows[r + i - 1]?.[c + j - 1] ?? '')),
+    setValues: values => values.forEach((row, i) => row.forEach((value, j) => {
+      inboxRows[r + i - 1] ||= [];
+      inboxRows[r + i - 1][c + j - 1] = value;
+    }))
+  })
+};
+sandbox.SpreadsheetApp = { openById: () => ({
+  getSheetByName: name => name === 'Inbox' ? inboxSheet : null
+}) };
 let processedUpdate = null;
 sandbox.processUpdate_ = (update, config) => { processedUpdate = { update, config }; };
 const acceptedWebhook = sandbox.doPost({
@@ -173,7 +195,8 @@ const acceptedWebhook = sandbox.doPost({
 });
 if (!acceptedWebhook || acceptedWebhook.body !== 'ok' || !lockReleased ||
     !processedUpdate || processedUpdate.update.update_id !== 123 ||
-    processedUpdate.config.allowedChatId !== '-1004439324869') {
+    processedUpdate.config.allowedChatId !== '-1004439324869' ||
+    inboxRows.length !== 2 || inboxRows[1][2] !== 'COMPLETED') {
   console.error('FAIL: valid doPost request was not parsed and processed exactly once');
   process.exitCode = 1;
 }

@@ -33,8 +33,12 @@ function runtime() {
       }};
   }
   const records = sheet(H), events = sheet(vm.runInContext('EVENT_HEADERS', state)),
-    groups = sheet(vm.runInContext('GROUP_HEADERS', state));
-  const spreadsheet = { getSheetByName: n => ({Records:records, Events:events, Groups:groups}[n]),
+    groups = sheet(vm.runInContext('GROUP_HEADERS', state)),
+    embeddings = sheet(vm.runInContext('EMBEDDING_HEADERS', state)),
+    inbox = sheet(['update_id','payload_json','status','claim_id','lease_until_utc',
+      'attempts','last_error','received_at_utc','completed_at_utc']);
+  const spreadsheet = { getSheetByName: n => ({Records:records, Events:events, Groups:groups,
+      Embeddings:embeddings, Inbox:inbox}[n]),
     insertSheet: () => {throw Error('unexpected sheet');} };
   state.SpreadsheetApp = { openById: () => spreadsheet };
   state.findRecordRow_ = (s,id) => {const i=s.data.findIndex(r=>r[0]===id); return i<0?0:i+1;};
@@ -57,7 +61,7 @@ function runtime() {
     : { blob:{setName(){return this;}}, mimeType:archive.mimeType,
       byteSize:archive.byteSize, sha256:archive.sha256 };
   state.createOrReusePreparedArchive_ = prepared => prepared && prepared.id ? prepared : archive;
-  return {s:state,F,H,props,records,events,groups,spreadsheet,config,message,archive,sheet,lock,
+  return {s:state,F,H,props,records,events,groups,embeddings,inbox,spreadsheet,config,message,archive,sheet,lock,
     productionCreate};
 }
 module.exports = {runtime};

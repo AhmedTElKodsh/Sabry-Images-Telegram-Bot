@@ -43,6 +43,22 @@ f=runtime();f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.confi
 let concurrent=0;
 f.s.storePhoto_=()=>{concurrent++;assert.equal(f.s.processPendingArchives().processed,0);return f.archive;};
 f.s.processPendingArchives();assert.equal(concurrent,1);
+// Losing the save-lock race after a successful download is infrastructure contention,
+// not an archive attempt. Refund and release the claim so contention cannot terminalize healthy bytes.
+f=runtime();f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config);
+for(let contentionAttempt=0;contentionAttempt<5;contentionAttempt++) {
+ f.s.storePhoto_=()=>{assert.equal(f.lock.tryLock(0),true);return f.archive;};
+ f.s.processPendingArchives();
+ assert.equal(f.records.data[1][f.F.ARCHIVE_STATUS],'ARCHIVING');
+ assert.equal(f.records.data[1][f.F.ARCHIVE_ATTEMPTS],1,
+   'expired save-lock claims must refund before the next claim');
+ f.lock.releaseLock();
+ f.records.data[1][f.F.ARCHIVE_LEASE_UNTIL_UTC]='2000-01-01T00:00:00.000Z';
+}
+f.s.storePhoto_=()=>f.archive;f.s.processPendingArchives();
+assert.equal(f.records.data[1][f.F.ARCHIVE_STATUS],'ARCHIVED');
+assert.equal(f.records.data[1][f.F.ARCHIVE_ATTEMPTS],1);
+assert.equal(f.records.data[1][f.F.ARCHIVE_CLAIM_ID],'');
 f=runtime();f.s.processPhoto_({update_id:1},f.message,f.records,f.events,f.config);
 f.s.storePhoto_=()=>{f.records.data[1][f.F.ARCHIVE_CLAIM_ID]='replacement';return f.archive;};
 f.s.processPendingArchives();assert.equal(f.records.data[1][f.F.ARCHIVE_STATUS],'ARCHIVING');

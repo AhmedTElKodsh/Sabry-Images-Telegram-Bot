@@ -50,12 +50,37 @@ assert.ok(Date.parse(records.data[1][F.CAPTION_SYNC_NEXT_ATTEMPT_UTC])-Date.now(
 records.data[1][F.CAPTION_SYNC_NEXT_ATTEMPT_UTC]='';records.data[1][F.CAPTION_SYNC_STATUS]='SYNC_PENDING';
 s.telegram_=()=>{records.data[1][F.CAPTION_SYNC_CLAIM_ID]='newer-claim';return {ok:true};};
 s.processPendingCaptionSync();assert.equal(records.data[1][F.CAPTION_SYNC_STATUS],'SYNC_PENDING');
+// A successful remote edit whose result cannot acquire the save lock remains retryable
+// without consuming the caption attempt budget or stranding a live claim.
+const contention=runtime();
+contention.s.processPhoto_({update_id:1},contention.message,contention.records,
+  contention.events,contention.config);
+contention.s.storePhoto_=()=>contention.archive;contention.s.processPendingArchives();
+const contentionRow=contention.records.data[1], contentionF=contention.F;
+contentionRow[contentionF.PUBLISH_STATUS]='PUBLISHED';contentionRow[contentionF.OUTPUT_MESSAGE_ID]='7';
+contentionRow[16]='TAG_UNAVAILABLE';
+contentionRow[contentionF.CAPTION_SYNC_STATUS]='SYNC_PENDING';
+for(let contentionAttempt=0;contentionAttempt<5;contentionAttempt++) {
+ contention.s.telegram_=()=>{assert.equal(contention.lock.tryLock(0),true);return {ok:true};};
+ contention.s.processPendingCaptionSync();
+ assert.equal(contention.records.data[1][contentionF.CAPTION_SYNC_STATUS],'SYNCING');
+ assert.equal(contention.records.data[1][contentionF.CAPTION_SYNC_ATTEMPTS],1,
+   'expired save-lock claims must refund before the next caption claim');
+ contention.lock.releaseLock();
+ contention.records.data[1][contentionF.CAPTION_SYNC_LEASE_UNTIL_UTC]='2000-01-01T00:00:00.000Z';
+}
+contention.s.telegram_=()=>({ok:true});contention.s.processPendingCaptionSync();
+assert.equal(contention.records.data[1][contentionF.CAPTION_SYNC_STATUS],'SYNCED');
+assert.equal(contention.records.data[1][contentionF.CAPTION_SYNC_ATTEMPTS],1);
+assert.equal(contention.records.data[1][contentionF.CAPTION_SYNC_CLAIM_ID],'');
 // Expired delivery claims are quarantined as unknown and cannot be resent.
-row=records.data[1];row[F.PUBLISH_STATUS]='PUBLISHING';row[F.OUTPUT_MESSAGE_ID]='';
-row[F.PUBLISH_LEASE_UNTIL_UTC]='2000-01-01T00:00:00.000Z';
-s.claimPendingPublications_(records,{inputChatId:'-1',outputChatId:'-2'},2);
-assert.equal(records.data[1][F.PUBLISH_STATUS],'PUBLISH_UNKNOWN');
-assert.equal(s.claimPendingPublications_(records,{inputChatId:'-1',outputChatId:'-2'},2).length,0);
+const expired=runtime();
+expired.s.processPhoto_({update_id:1},expired.message,expired.records,expired.events,expired.config);
+row=expired.records.data[1];row[expired.F.PUBLISH_STATUS]='PUBLISHING';row[expired.F.OUTPUT_MESSAGE_ID]='';
+row[expired.F.PUBLISH_LEASE_UNTIL_UTC]='2000-01-01T00:00:00.000Z';
+expired.s.claimPendingPublications_(expired.records,{inputChatId:'-1',outputChatId:'-2'},2);
+assert.equal(expired.records.data[1][expired.F.PUBLISH_STATUS],'PUBLISH_UNKNOWN');
+assert.equal(expired.s.claimPendingPublications_(expired.records,{inputChatId:'-1',outputChatId:'-2'},2).length,0);
 console.log('PASS: caption ordering/removal, fallback, explicit enrichment, same-message synchronization and meaningful ranking');
 // Dense generated metadata must reserve visible space for the latest edited human caption.
 {

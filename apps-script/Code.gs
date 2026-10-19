@@ -62,6 +62,11 @@ const EMBEDDING_HEADERS = [
   'status', 'attempts', 'last_error', 'updated_at_utc'
 ];
 
+const INBOX_HEADERS = [
+  'update_id', 'payload_json', 'status', 'claim_id', 'lease_until_utc',
+  'attempts', 'last_error', 'received_at_utc', 'completed_at_utc'
+];
+
 const DEFAULT_GROQ_MODEL = 'qwen/qwen3.8-27b';
 const WEBHOOK_SECRET_PARAMETER = 'telegram_webhook_key';
 const GROQ_TAG_BATCH_SIZE = 2;
@@ -90,6 +95,10 @@ const GEMINI_EMBEDDING_DIMENSIONS = 768;
 const GEMINI_INDEX_BATCH_SIZE = 2;
 const GEMINI_INDEX_LEASE_MINUTES = 10;
 const ARCHIVE_MAX_ATTEMPTS = 5;
+const INBOX_BATCH_SIZE = 5;
+const INBOX_MAX_ATTEMPTS = 5;
+const INBOX_LEASE_MINUTES = 10;
+const INBOX_MAX_PAYLOAD_CHARACTERS = 45000;
 
 function setupPoc() {
   const properties = PropertiesService.getScriptProperties();
@@ -117,6 +126,9 @@ function setupPoc() {
   );
   prepareEmbeddingSheet_(
     spreadsheet.getSheetByName('Embeddings') || spreadsheet.insertSheet('Embeddings')
+  );
+  prepareInboxSheet_(
+    spreadsheet.getSheetByName('Inbox') || spreadsheet.insertSheet('Inbox')
   );
 
   return {
@@ -171,12 +183,124 @@ function doPost(e) {
   if (!lock.tryLock(10000)) throw new Error('Webhook is busy; retry this update.');
   try {
     const config = getConfig_(false);
-    processUpdate_(update, config);
+    const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+    const inbox = spreadsheet.getSheetByName('Inbox');
+    if (!inbox) throw new Error('Run setupPoc() first.');
+    const receipt = admitWebhookUpdate_(inbox, update);
+    if (['COMPLETED', 'FAILED', 'UNKNOWN'].indexOf(String(receipt.row[2])) === -1) {
+      const claim = claimInboxReceipt_(inbox, receipt.number, receipt.row);
+      if (!claim) throw new Error('Webhook update is already being processed.');
+      try {
+        processUpdate_(update, config);
+        finishInboxClaim_(inbox, claim, true);
+      } catch (error) {
+        finishInboxClaim_(inbox, claim, false);
+        throw new Error('Webhook update processing failed.');
+      }
+    }
   } finally {
     lock.releaseLock();
   }
   // Telegram does not follow ContentService's mandatory 302 redirect.
   return HtmlService.createHtmlOutput('ok');
+}
+
+function findInboxReceipt_(sheet, updateId) {
+  if (sheet.getLastRow() < 2) return null;
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, INBOX_HEADERS.length).getValues();
+  const target = String(updateId);
+  for (let index = 0; index < values.length; index++) {
+    if (String(values[index][0]) === target) return { number: index + 2, row: values[index] };
+  }
+  return null;
+}
+
+function admitWebhookUpdate_(sheet, update) {
+  const updateId = String(update && update.update_id === 0 ? 0 : update && update.update_id || '');
+  if (!/^\d+$/.test(updateId)) throw new Error('Webhook update_id is invalid.');
+  const existing = findInboxReceipt_(sheet, updateId);
+  if (existing) return existing;
+  const payload = JSON.stringify(update);
+  if (!payload || payload.length > INBOX_MAX_PAYLOAD_CHARACTERS) {
+    throw new Error('Webhook payload exceeds the durable inbox limit.');
+  }
+  const row = [updateId, sheetText_(payload), 'PENDING', '', '', 0, '', new Date().toISOString(), ''];
+  sheet.appendRow(row);
+  return { number: sheet.getLastRow(), row: row };
+}
+
+function inboxLeaseIsActive_(row) {
+  return String(row[2]) === 'PROCESSING' && Date.parse(String(row[4] || '')) > Date.now();
+}
+
+function claimInboxReceipt_(sheet, rowNumber, currentRow) {
+  const row = currentRow || sheet.getRange(rowNumber, 1, 1, INBOX_HEADERS.length).getValues()[0];
+  const status = String(row[2]);
+  if (['COMPLETED', 'FAILED', 'UNKNOWN'].indexOf(status) !== -1 || inboxLeaseIsActive_(row)) return null;
+  if (status === 'PROCESSING') {
+    row[2] = 'UNKNOWN'; row[3] = ''; row[4] = '';
+    row[6] = 'Webhook processing lease expired; external effects require reconciliation.';
+    sheet.getRange(rowNumber, 1, 1, INBOX_HEADERS.length).setValues([row]);
+    return null;
+  }
+  let attempts = Number(row[5]) || 0;
+  if (attempts >= INBOX_MAX_ATTEMPTS) {
+    row[2] = 'FAILED';
+    row[3] = ''; row[4] = ''; row[6] = 'Webhook update exhausted its retry budget.';
+    sheet.getRange(rowNumber, 1, 1, INBOX_HEADERS.length).setValues([row]);
+    return null;
+  }
+  const claimId = Utilities.getUuid();
+  attempts++;
+  row[2] = 'PROCESSING'; row[3] = claimId;
+  row[4] = new Date(Date.now() + INBOX_LEASE_MINUTES * 60000).toISOString();
+  row[5] = attempts; row[6] = '';
+  sheet.getRange(rowNumber, 1, 1, INBOX_HEADERS.length).setValues([row]);
+  return { number: rowNumber, id: claimId };
+}
+
+function finishInboxClaim_(sheet, claim, completed) {
+  const row = sheet.getRange(claim.number, 1, 1, INBOX_HEADERS.length).getValues()[0];
+  if (String(row[3]) !== String(claim.id)) return false;
+  row[2] = completed ? 'COMPLETED' :
+    (Number(row[5]) >= INBOX_MAX_ATTEMPTS ? 'FAILED' : 'PENDING');
+  row[3] = ''; row[4] = '';
+  row[6] = completed ? '' : 'Webhook update processing failed.';
+  row[8] = completed ? new Date().toISOString() : '';
+  sheet.getRange(claim.number, 1, 1, INBOX_HEADERS.length).setValues([row]);
+  return true;
+}
+
+function processPendingInbox() {
+  const summary = { processed: 0, completed: 0, retrying: 0, failed: 0 };
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return summary;
+  try {
+    const config = getConfig_(false);
+    const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Inbox');
+    if (!sheet) throw new Error('Run setupPoc() first.');
+    const lastRow = sheet.getLastRow();
+    for (let number = 2; number <= lastRow && summary.processed < INBOX_BATCH_SIZE; number++) {
+      const row = sheet.getRange(number, 1, 1, INBOX_HEADERS.length).getValues()[0];
+      const claim = claimInboxReceipt_(sheet, number, row);
+      if (!claim) continue;
+      summary.processed++;
+      try {
+        const update = JSON.parse(readSheetText_(row[1]));
+        processUpdate_(update, config);
+        finishInboxClaim_(sheet, claim, true);
+        summary.completed++;
+      } catch (error) {
+        finishInboxClaim_(sheet, claim, false);
+        const saved = sheet.getRange(number, 1, 1, INBOX_HEADERS.length).getValues()[0];
+        if (String(saved[2]) === 'FAILED') summary.failed++;
+        else summary.retrying++;
+      }
+    }
+    return summary;
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function processUpdate_(update, config) {
@@ -311,14 +435,36 @@ function processSearchCommand_(update, message, config, command, outputGroupSear
       config
     );
   } else {
-    try {
-      results.forEach(function (result, index) {
+    let partial = false;
+    for (let index = 0; index < results.length; index++) {
+      const result = results[index];
+      const deliveryState = searchDeliveryState_(events, update.update_id, result.recordId);
+      if (deliveryState === 'SENT') continue;
+      if (deliveryState === 'CLAIMED' || deliveryState === 'UNKNOWN') {
+        partial = true;
+        break;
+      }
+      appendSearchDeliveryEvent_(events, update, message, result, 'CLAIMED');
+      try {
         result.searchMode = search.mode;
         sendSearchPhoto_(message.chat.id, result, index, results.length, config);
-      });
-    } catch (error) {
-      sendText_(message.chat.id, 'Search is temporarily unavailable. Please try again later.', config);
-      return 'search-unavailable';
+        appendSearchDeliveryEvent_(events, update, message, result, 'SENT');
+      } catch (error) {
+        // The transport may have accepted the photo even when the response was lost.
+        // Quarantine this result for the current update instead of risking a resend.
+        try { appendSearchDeliveryEvent_(events, update, message, result, 'UNKNOWN'); }
+        catch (ignored) {}
+        partial = true;
+        break;
+      }
+    }
+    if (partial) {
+      try {
+        sendText_(message.chat.id,
+          'Some search results could not be confirmed. Run a new search to try again.', config);
+      } catch (ignored) {}
+      appendEvent_(events, update, message, 'command', command.query, '');
+      return 'search-partial';
     }
   }
   appendEvent_(events, update, message, 'command', command.query, '');
@@ -794,6 +940,7 @@ function getConfig_(requireChat) {
     outputChatId: String(properties.OUTPUT_CHAT_ID || '').trim(),
     outputPublishingEnabled: properties[OUTPUT_PUBLISHING_ENABLED_PROPERTY] === 'true',
     outputPublishingEnabledRaw: String(properties[OUTPUT_PUBLISHING_ENABLED_PROPERTY] || ''),
+    operatorAlertChatId: String(properties.OPERATOR_ALERT_CHAT_ID || '').trim(),
     outputGroupsVerifiedFor: String(properties[OUTPUT_GROUP_VERIFICATION_PROPERTY] || ''),
     botTokenFingerprint: properties.BOT_TOKEN ? botTokenFingerprint_(properties.BOT_TOKEN) : ''
   };
@@ -3108,6 +3255,15 @@ function prepareSheet_(sheet, headers) {
   sheet.autoResizeColumns(1, headers.length);
 }
 
+function prepareInboxSheet_(sheet) {
+  ensureSheetColumns_(sheet, INBOX_HEADERS.length);
+  if (sheet.getLastRow() > 0 &&
+      !headersMatch_(sheet.getRange(1, 1, 1, INBOX_HEADERS.length).getValues()[0], INBOX_HEADERS)) {
+    throw new Error('Inbox header does not match the durable receipt contract.');
+  }
+  prepareSheet_(sheet, INBOX_HEADERS);
+}
+
 function prepareRecordsSheet_(sheet) {
   const legacyHeaders = RECORD_HEADERS.slice(0, 24);
   const extensionHeaders = RECORD_HEADERS.slice(24);
@@ -3186,6 +3342,39 @@ function appendEvent_(sheet, update, message, kind, text, recordId) {
     kind,
     sheetText_(text),
     recordId || '',
+    Utilities.formatDate(new Date(), 'UTC', "yyyy-MM-dd'T'HH:mm:ss'Z'")
+  ]);
+}
+
+function searchDeliveryEventId_(updateId, recordId) {
+  return 'search:' + String(updateId) + ':' + String(recordId);
+}
+
+function searchDeliveryState_(sheet, updateId, recordId) {
+  if (!sheet || sheet.getLastRow() < 2) return '';
+  const key = searchDeliveryEventId_(updateId, recordId);
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, EVENT_HEADERS.length)
+    .getValues();
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0]) === key && values[i][4] === 'search-delivery') {
+      return String(values[i][5] || '');
+    }
+  }
+  return '';
+}
+
+function appendSearchDeliveryEvent_(sheet, update, message, result, state) {
+  if (['CLAIMED', 'SENT', 'UNKNOWN'].indexOf(state) === -1) {
+    throw new Error('Unknown search delivery state.');
+  }
+  sheet.appendRow([
+    searchDeliveryEventId_(update.update_id, result.recordId),
+    String(message.chat.id),
+    String(message.message_id),
+    getUserId_(message),
+    'search-delivery',
+    state,
+    String(result.recordId),
     Utilities.formatDate(new Date(), 'UTC', "yyyy-MM-dd'T'HH:mm:ss'Z'")
   ]);
 }
@@ -3341,6 +3530,9 @@ function searchWithGeminiFallback_(spreadsheet, records, query, limit) {
   try {
     const properties = PropertiesService.getScriptProperties().getProperties();
     const config = parseGeminiPilotConfig_(properties, new Date());
+    if (!semanticEvaluationGatePasses_(properties, config, query, new Date())) {
+      return { mode: 'Lexical fallback', results: lexical.slice(0, limit) };
+    }
     if (!config.querySet.has(normalizeSearchText_(query))) {
       return { mode: 'Lexical fallback', results: lexical.slice(0, limit) };
     }
@@ -3396,6 +3588,63 @@ function searchWithGeminiFallback_(spreadsheet, records, query, limit) {
     console.warn('Semantic pilot unavailable; using lexical fallback.');
   }
   return { mode: 'Lexical fallback', results: lexical.slice(0, limit) };
+}
+
+function semanticEvaluationResult_(properties) {
+  try {
+    return JSON.parse(String(properties.SEMANTIC_EVALUATION_RESULT_JSON || ''));
+  } catch (error) {
+    return null;
+  }
+}
+
+function semanticEvaluationMatches_(evaluation, config, query, now) {
+  const current = now || new Date();
+  const metrics = evaluation && evaluation.metrics || {};
+  return Boolean(evaluation && evaluation.status === 'PASS' && evaluation.evaluation_id &&
+    evaluation.integration_approved_by && !isNaN(Date.parse(evaluation.integration_approved_at)) &&
+    !isNaN(Date.parse(evaluation.expires_at)) && new Date(evaluation.expires_at) > current &&
+    new Date(evaluation.expires_at) <= new Date(config.expiresAt) &&
+    evaluation.dataset_id === config.datasetId && evaluation.model === config.model &&
+    evaluation.approved_at === config.approvedAt &&
+    Array.isArray(evaluation.record_ids) &&
+    evaluation.record_ids.join('\n') === config.recordIds.join('\n') &&
+    Array.isArray(evaluation.queries) &&
+    evaluation.queries.join('\n') === config.queries.join('\n') &&
+    config.querySet.has(normalizeSearchText_(query)) &&
+    Number(metrics.image_count) >= 50 && Number(metrics.image_count) <= 100 &&
+    Number(metrics.query_count) >= 15 && Number(metrics.query_count) <= 20 &&
+    Number(metrics.silent_omissions) === 0 &&
+    Number(metrics.ndcg_at_10_gain) >= 0.10 &&
+    Number(metrics.relevant_in_top_five) >= 0.90 &&
+    Number(metrics.false_positive_top_result_rate) <= 0.20 &&
+    Number(metrics.language_gap) <= 0.10 &&
+    Number(metrics.provider_failure_rate) <= 0.05);
+}
+
+function semanticEvaluationGatePasses_(properties, config, query, now) {
+  const evaluation = semanticEvaluationResult_(properties || {});
+  return semanticEvaluationMatches_(evaluation, config, query, now) &&
+    String(properties.SEMANTIC_TEACHER_SEARCH_EVALUATION_ID || '') ===
+      String(evaluation.evaluation_id);
+}
+
+function enableEvaluatedSemanticTeacherSearch(evaluationId) {
+  const propertiesService = PropertiesService.getScriptProperties();
+  const properties = propertiesService.getProperties();
+  const config = parseGeminiPilotConfig_(properties, new Date());
+  const evaluation = semanticEvaluationResult_(properties);
+  if (!evaluation || String(evaluation.evaluation_id) !== String(evaluationId || '') ||
+      !semanticEvaluationMatches_(evaluation, config, config.queries[0], new Date())) {
+    throw new Error('Semantic evaluation or integration approval does not match the current pilot.');
+  }
+  propertiesService.setProperty('SEMANTIC_TEACHER_SEARCH_EVALUATION_ID', String(evaluation.evaluation_id));
+  return { enabled: true, evaluation_id: String(evaluation.evaluation_id) };
+}
+
+function disableEvaluatedSemanticTeacherSearch() {
+  PropertiesService.getScriptProperties().deleteProperty('SEMANTIC_TEACHER_SEARCH_EVALUATION_ID');
+  return { enabled: false };
 }
 
 function geminiPilotConfigMatches_(expected, current) {
@@ -4621,6 +4870,7 @@ function migrateSharedCatalog() {
       const registry = spreadsheet.getSheetByName('Groups');
       if (!registry) throw new Error('Groups registry is missing.');
       prepareGroupRegistry_(registry);
+      prepareInboxSheet_(spreadsheet.getSheetByName('Inbox') || spreadsheet.insertSheet('Inbox'));
       return { version: 3, migrated: false };
     }
     // Authenticate the old token-bound marker and actual bot/chat identities before seeding.
@@ -4632,6 +4882,7 @@ function migrateSharedCatalog() {
     prepareRecordsSheet_(records);
     let registry = spreadsheet.getSheetByName('Groups');
     registry = registry || spreadsheet.insertSheet('Groups'); prepareGroupRegistry_(registry);
+    prepareInboxSheet_(spreadsheet.getSheetByName('Inbox') || spreadsheet.insertSheet('Inbox'));
     if (!groupRows_(spreadsheet).some(function (row) { return String(row[0]) === groups.inputChatId; })) {
       registry.appendRow([groups.inputChatId, '', '000000000000:0000000000000000', 'ACTIVE', 'administrator', new Date().toISOString(), config.botTokenFingerprint, 'MIGRATION_VERIFIED']);
     }
@@ -4761,12 +5012,13 @@ function pauseStageForError_(stage, error) {
 
 function catalogHealth() {
   const p = PropertiesService.getScriptProperties(), config = getConfig_(false);
-  const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName('Records');
+  const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+  const sheet = spreadsheet.getSheetByName('Records');
   const rows = sheet && sheet.getLastRow() > 1
     ? sheet.getRange(2, 1, sheet.getLastRow() - 1, RECORD_HEADERS.length).getValues() : [];
   const fields = { archive: RECORD_FIELD.ARCHIVE_STATUS, analysis: 16,
     publication: RECORD_FIELD.PUBLISH_STATUS, caption: RECORD_FIELD.CAPTION_SYNC_STATUS };
-  return Object.keys(fields).map(function (stage) {
+  const health = Object.keys(fields).map(function (stage) {
     let backlog = 0, failed = 0, historicalBacklog = 0, historicalFailed = 0;
     rows.forEach(function (row) {
       const status = String(row[fields[stage]] || '');
@@ -4788,6 +5040,272 @@ function catalogHealth() {
       backlog: backlog, failed: failed, historicalBacklog: historicalBacklog,
       historicalFailed: historicalFailed, recovery: 'recoverCatalogStage("' + stage + '")' };
   });
+  const inbox = spreadsheet.getSheetByName('Inbox');
+  const inboxRows = inbox && inbox.getLastRow() > 1
+    ? inbox.getRange(2, 1, inbox.getLastRow() - 1, INBOX_HEADERS.length).getValues() : [];
+  health.push({
+    stage: 'inbox',
+    paused: false,
+    backlog: inboxRows.filter(function (row) {
+      return ['PENDING', 'PROCESSING'].indexOf(String(row[2])) !== -1;
+    }).length,
+    failed: inboxRows.filter(function (row) {
+      return ['FAILED', 'UNKNOWN'].indexOf(String(row[2])) !== -1;
+    }).length,
+    historicalBacklog: 0,
+    historicalFailed: 0,
+    recovery: 'processPendingInbox()'
+  });
+  return health;
+}
+
+function managedCatalogHandlers_(config) {
+  const handlers = [
+    'processPendingInbox', 'processPendingArchives', 'processPendingEnrollments',
+    'processPendingCaptionSync'
+  ];
+  if (config.groqTaggingEnabled) handlers.push('processPendingTags');
+  if (config.outputPublishingEnabled) handlers.push('processPendingPublications');
+  return handlers;
+}
+
+function catalogRecoveryCandidates_(spreadsheet) {
+  const candidates = [];
+  const records = spreadsheet.getSheetByName('Records');
+  const rows = records && records.getLastRow() > 1
+    ? records.getRange(2, 1, records.getLastRow() - 1, RECORD_HEADERS.length).getValues() : [];
+  rows.forEach(function (row) {
+    const recordId = String(row[0] || '');
+    const archive = String(row[RECORD_FIELD.ARCHIVE_STATUS] || '');
+    const publication = String(row[RECORD_FIELD.PUBLISH_STATUS] || '');
+    if (archive === 'ARCHIVE_FAILED_TERMINAL' || archive === 'ARCHIVE_CONFLICT') {
+      candidates.push({ record_id: recordId, stage: 'archive', status: archive,
+        action: 'RECORD_SCOPED_ARCHIVE_REVIEW' });
+    }
+    if (publication === 'PUBLISH_UNKNOWN') {
+      candidates.push({ record_id: recordId, stage: 'publication', status: publication,
+        action: 'MANUAL_PUBLICATION_RECONCILIATION_ONLY' });
+    }
+  });
+  const inbox = spreadsheet.getSheetByName('Inbox');
+  const receipts = inbox && inbox.getLastRow() > 1
+    ? inbox.getRange(2, 1, inbox.getLastRow() - 1, INBOX_HEADERS.length).getValues() : [];
+  receipts.forEach(function (row) {
+    if (['FAILED', 'UNKNOWN'].indexOf(String(row[2])) !== -1) {
+      candidates.push({ update_id: String(row[0]), stage: 'inbox', status: String(row[2]),
+        action: 'INBOX_FAILURE_REVIEW' });
+    }
+  });
+  return candidates;
+}
+
+function catalogOperationalReport() {
+  const config = getConfig_(false);
+  const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+  const issues = [];
+  const triggerCounts = {};
+  managedCatalogHandlers_(config).forEach(function (handler) {
+    const count = handlerTriggers_(handler).length;
+    triggerCounts[handler] = count;
+    if (count !== 1) issues.push({ code: 'TRIGGER_COUNT', handler: handler, actual: count, expected: 1 });
+  });
+  const health = catalogHealth();
+  health.forEach(function (stage) {
+    if (stage.paused) issues.push({ code: 'STAGE_PAUSED', stage: stage.stage });
+    if (stage.failed) issues.push({ code: 'STAGE_FAILURES', stage: stage.stage, count: stage.failed });
+  });
+  let webhook = { ok: false, pending_update_count: null, has_error: true };
+  try {
+    const raw = redactWebhookInfo_(telegram_('getWebhookInfo', {}, config.botToken));
+    const result = raw && raw.result || {};
+    webhook = {
+      ok: raw && raw.ok === true,
+      pending_update_count: Number(result.pending_update_count || 0),
+      has_error: Boolean(result.last_error_message || result.last_error_date)
+    };
+  } catch (error) {
+    webhook = { ok: false, pending_update_count: null, has_error: true };
+  }
+  if (!webhook.ok || webhook.has_error) issues.push({ code: 'WEBHOOK_ERROR' });
+  if (Number(webhook.pending_update_count || 0) > 0) {
+    issues.push({ code: 'WEBHOOK_PENDING', count: webhook.pending_update_count });
+  }
+  return {
+    generated_at_utc: new Date().toISOString(),
+    health: health,
+    triggers: triggerCounts,
+    webhook: webhook,
+    issues: issues,
+    recovery_candidates: catalogRecoveryCandidates_(spreadsheet)
+  };
+}
+
+function sendCatalogOperationalAlert() {
+  const config = getConfig_(false);
+  if (!/^-?\d+$/.test(String(config.operatorAlertChatId || ''))) {
+    return { sent: false, disabled: true };
+  }
+  const report = catalogOperationalReport();
+  if (!report.issues.length && !report.recovery_candidates.length) {
+    return { sent: false, clear: true };
+  }
+  const fingerprint = JSON.stringify({
+    issues: report.issues,
+    candidates: report.recovery_candidates
+  });
+  const properties = PropertiesService.getScriptProperties();
+  if (properties.getProperty('CATALOG_ALERT_FINGERPRINT') === fingerprint) {
+    return { sent: false, suppressed: true };
+  }
+  const issueText = report.issues.map(function (issue) {
+    return issue.code + (issue.stage ? ':' + issue.stage : '') +
+      (issue.handler ? ':' + issue.handler : '');
+  }).join(', ');
+  const message = ('Catalog operational alert\nIssues: ' + issueText +
+    '\nRecovery candidates: ' + report.recovery_candidates.length +
+    '\nRun catalogOperationalReport() for the sanitized review.').slice(0, 3500);
+  telegram_('sendMessage', { chat_id: config.operatorAlertChatId, text: message }, config.botToken);
+  properties.setProperty('CATALOG_ALERT_FINGERPRINT', fingerprint);
+  return { sent: true, issues: report.issues.length,
+    recovery_candidates: report.recovery_candidates.length };
+}
+
+function validateErasureRequest_(request) {
+  const value = request || {};
+  const requestId = String(value.request_id || '').trim();
+  const recordId = String(value.record_id || '').trim();
+  const approver = String(value.approver || '').trim();
+  const approvedAt = String(value.approved_at || '').trim();
+  const scope = String(value.scope || 'RECORD').toUpperCase();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{5,79}$/.test(requestId)) {
+    throw new Error('Erasure request_id is invalid.');
+  }
+  if (!recordId) throw new Error('Erasure record_id is required.');
+  if (!approver || approver.length > 120) throw new Error('Erasure approver is invalid.');
+  if (!approvedAt || isNaN(Date.parse(approvedAt))) throw new Error('Erasure approved_at is invalid.');
+  if (['RECORD', 'CANONICAL_GROUP'].indexOf(scope) === -1) throw new Error('Erasure scope is invalid.');
+  return { request_id: requestId, record_id: recordId, approver: approver,
+    approved_at: new Date(approvedAt).toISOString(), scope: scope };
+}
+
+function erasureRows_(records) {
+  return records && records.getLastRow() > 1
+    ? records.getRange(2, 1, records.getLastRow() - 1, RECORD_HEADERS.length).getValues() : [];
+}
+
+function planCatalogErasure(request) {
+  const approved = validateErasureRequest_(request);
+  const config = getConfig_(false);
+  const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+  const records = spreadsheet.getSheetByName('Records');
+  if (!records) throw new Error('Run setupPoc() first.');
+  const rows = erasureRows_(records);
+  const requested = rows.filter(function (row) { return String(row[0]) === approved.record_id; })[0];
+  if (!requested) throw new Error('Erasure record_id was not found.');
+  if (String(requested[16]) === 'ERASED') throw new Error('Erasure record is already a tombstone.');
+  const canonicalId = canonicalRecordId_(requested);
+  const members = rows.filter(function (row) {
+    return String(row[16]) !== 'ERASED' && canonicalRecordId_(row) === canonicalId;
+  });
+  if (approved.scope === 'RECORD' && canonicalRowIsOwner_(requested) && members.length > 1) {
+    throw new Error('Owner erasure must include the canonical group while retained aliases exist.');
+  }
+  const targets = approved.scope === 'CANONICAL_GROUP' ? members : [requested];
+  const targetIds = targets.map(function (row) { return String(row[0]); });
+  const published = targets.some(function (row) { return Boolean(row[RECORD_FIELD.OUTPUT_MESSAGE_ID]); });
+  const hasDriveObject = targets.some(function (row) { return Boolean(row[13]); });
+  const retainShared = approved.scope === 'RECORD' && !canonicalRowIsOwner_(requested);
+  return {
+    dry_run: true,
+    request_id: approved.request_id,
+    record_id: approved.record_id,
+    canonical_record_id: canonicalId,
+    scope: approved.scope,
+    approver: approved.approver,
+    approved_at: approved.approved_at,
+    target_record_ids: targetIds,
+    drive_disposition: retainShared ? 'RETAIN_SHARED_CANONICAL_OBJECT' :
+      (hasDriveObject ? 'MANUAL_DRIVE_DELETION_REQUIRED' : 'NO_DRIVE_OBJECT_RECORDED'),
+    output_disposition: published ? 'MANUAL_TELEGRAM_DELETION_REQUIRED' : 'NO_OUTPUT_MESSAGE_RECORDED',
+    backup_warning: 'Backups and exports are controlled separately and require independent retention action.'
+  };
+}
+
+function findErasureEvent_(events, eventId) {
+  if (!events || events.getLastRow() < 2) return '';
+  const rows = events.getRange(2, 1, events.getLastRow() - 1, EVENT_HEADERS.length).getValues();
+  for (let index = rows.length - 1; index >= 0; index--) {
+    if (String(rows[index][0]) === eventId) return String(rows[index][4] || '');
+  }
+  return '';
+}
+
+function appendErasureEvent_(events, eventId, kind, plan) {
+  events.appendRow([
+    eventId, '', '', '', kind, sheetText_(JSON.stringify({
+      request_id: plan.request_id,
+      approver: plan.approver,
+      approved_at: plan.approved_at,
+      scope: plan.scope,
+      target_record_ids: plan.target_record_ids,
+      drive_disposition: plan.drive_disposition,
+      output_disposition: plan.output_disposition
+    })), plan.record_id, new Date().toISOString()
+  ]);
+}
+
+function executeCatalogErasure(request) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) throw new Error('Catalog erasure is busy.');
+  try {
+    const approved = validateErasureRequest_(request);
+    const config = getConfig_(false);
+    const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+    const records = spreadsheet.getSheetByName('Records');
+    const events = spreadsheet.getSheetByName('Events');
+    if (!records || !events) throw new Error('Run setupPoc() first.');
+    const eventId = 'erasure:' + approved.request_id;
+    const prior = findErasureEvent_(events, eventId);
+    if (prior === 'erasure-completed') return { status: 'DUPLICATE', request_id: approved.request_id };
+    if (prior) throw new Error('Erasure request has an incomplete prior execution; operator review is required.');
+    const plan = planCatalogErasure(approved);
+    appendErasureEvent_(events, eventId, 'erasure-claimed', plan);
+    try {
+      const target = {};
+      plan.target_record_ids.forEach(function (recordId) { target[recordId] = true; });
+      const embeddings = spreadsheet.getSheetByName('Embeddings');
+      if (embeddings && embeddings.getLastRow() > 1) {
+        const vectors = embeddings.getRange(2, 1, embeddings.getLastRow() - 1,
+          EMBEDDING_HEADERS.length).getValues();
+        vectors.forEach(function (row) {
+          if (!target[String(row[0])]) return;
+          row[7] = ''; row[8] = 'ERASED'; row[10] = ''; row[11] = new Date().toISOString();
+        });
+        embeddings.getRange(2, 1, vectors.length, EMBEDDING_HEADERS.length).setValues(vectors);
+      }
+      const rows = erasureRows_(records);
+      rows.forEach(function (row, index) {
+        if (!target[String(row[0])]) return;
+        const recordId = String(row[0]);
+        const canonicalId = canonicalRecordId_(row);
+        const tombstone = Array(RECORD_HEADERS.length).fill('');
+        tombstone[0] = recordId;
+        tombstone[16] = 'ERASED';
+        tombstone[RECORD_FIELD.ARCHIVE_STATUS] = 'ERASED';
+        tombstone[RECORD_FIELD.PUBLISH_STATUS] = 'ERASED';
+        tombstone[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'ERASED';
+        tombstone[RECORD_FIELD.CANONICAL_RECORD_ID] = canonicalId;
+        tombstone[RECORD_FIELD.CANONICAL_ROLE] = 'TOMBSTONE';
+        records.getRange(index + 2, 1, 1, RECORD_HEADERS.length).setValues([tombstone]);
+      });
+      appendErasureEvent_(events, eventId, 'erasure-completed', plan);
+      return Object.assign({ status: 'COMPLETED' }, plan, { dry_run: false });
+    } catch (error) {
+      throw new Error('Catalog erasure execution is incomplete; operator review is required.');
+    }
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function historicalDuplicateCandidateReportFromRows_(rows) {
@@ -5141,7 +5659,13 @@ function processPendingArchives() {
       if (['ARCHIVE_PENDING', 'ARCHIVE_RETRY', 'ARCHIVING'].indexOf(status) === -1) return;
       const deadline = status === 'ARCHIVING' ? row[RECORD_FIELD.ARCHIVE_LEASE_UNTIL_UTC] : row[RECORD_FIELD.ARCHIVE_NEXT_ATTEMPT_UTC];
       if (deadline && (!canonicalIsoInstant_(deadline) || Date.parse(deadline) > Date.now())) return;
-      const attempts = Number(row[RECORD_FIELD.ARCHIVE_ATTEMPTS] || 0);
+      let attempts = Number(row[RECORD_FIELD.ARCHIVE_ATTEMPTS] || 0);
+      if (status === 'ARCHIVING') {
+        // An expired lease means no result was durably saved. Reclaiming it is
+        // infrastructure recovery, not another archive attempt.
+        attempts = Math.max(0, attempts - 1);
+        row[RECORD_FIELD.ARCHIVE_ATTEMPTS] = attempts;
+      }
       if (attempts >= 5) { row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVE_FAILED_TERMINAL'; }
       else {
         row[RECORD_FIELD.ARCHIVE_STATUS] = 'ARCHIVING';
@@ -5237,7 +5761,13 @@ function processPendingCaptionSync() {
       const deadline = status === 'SYNCING' ? row[RECORD_FIELD.CAPTION_SYNC_LEASE_UNTIL_UTC] : row[RECORD_FIELD.CAPTION_SYNC_NEXT_ATTEMPT_UTC];
       if (['SYNC_PENDING', 'SYNC_RETRY', 'SYNCING'].indexOf(status) === -1 ||
           (deadline && (!canonicalIsoInstant_(deadline) || Date.parse(deadline) > Date.now()))) return;
-      const attempts = Number(row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] || 0);
+      let attempts = Number(row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] || 0);
+      if (status === 'SYNCING') {
+        // Retrying an expired idempotent caption edit must not spend the
+        // attempt budget when only result persistence lost the save-lock race.
+        attempts = Math.max(0, attempts - 1);
+        row[RECORD_FIELD.CAPTION_SYNC_ATTEMPTS] = attempts;
+      }
       if (attempts >= 5) {
         row[RECORD_FIELD.CAPTION_SYNC_STATUS] = 'SYNC_FAILED';
         row[RECORD_FIELD.CAPTION_SYNC_ERROR] = 'Maximum caption synchronization attempts reached.';
@@ -5303,7 +5833,8 @@ function processPendingCaptionSync() {
 
 function installSharedCatalogWorkers() {
   if (!sharedCatalogEnabled_()) throw new Error('Migrate the catalog first.');
-  ['processPendingArchives', 'processPendingEnrollments', 'processPendingCaptionSync'].forEach(replaceTimeTrigger_);
+  ['processPendingInbox', 'processPendingArchives', 'processPendingEnrollments', 'processPendingCaptionSync']
+    .forEach(replaceTimeTrigger_);
   return { installed: true };
 }
 

@@ -26,13 +26,17 @@ function fixture() {
     row('elsewhere', { OUTPUT_CHAT_ID: '-1003' }), row('unverified', { ARCHIVE_STATUS: '' }),
     row('missing-id', { OUTPUT_MESSAGE_ID: '' })];
   const events = [], sends = [], memberships = [];
+  let failPhotoCalls = new Set(), photoCalls = 0;
   let reads = 0;
   const recordSheet = { getLastRow: () => rows.length + 1,
     getRange: () => ({ getValues: () => { reads++; return rows; } }) };
   const eventSheet = { getLastRow: () => events.length + 1, appendRow: row => events.push(row),
-    getRange: () => ({ createTextFinder: text => ({ matchEntireCell: () => ({
-      findNext: () => events.some(e => e[0] === text) ? {} : null
-    }) }) }) };
+    getRange: (r,c,n=1,m=8) => ({
+      getValues: () => events.slice(r-2,r-2+n).map(row => row.slice(c-1,c-1+m)),
+      createTextFinder: text => ({ matchEntireCell: () => ({
+        findNext: () => events.some(e => e[0] === text) ? {} : null
+      }) })
+    }) };
   s.SpreadsheetApp = { openById: () => ({ getSheetByName: name =>
     name === 'Records' ? recordSheet : name === 'Events' ? eventSheet : null }) };
   s.PropertiesService = { getScriptProperties: () => ({ getProperty: () => '',
@@ -51,6 +55,9 @@ function fixture() {
       return { ok: true, result: membership };
     }
     assert.ok(['sendMessage', 'sendPhoto'].includes(method), 'unexpected Telegram side effect');
+    if (method === 'sendPhoto' && failPhotoCalls.has(++photoCalls)) {
+      const error = new Error('simulated ambiguous delivery'); error.httpStatus = 500; throw error;
+    }
     sends.push({ method, payload });
     return { ok: true, result: { message_id: 100 } };
   };
@@ -59,7 +66,9 @@ function fixture() {
   const run = (overrides = {}, id = 10) => s.processUpdate_({ update_id: id,
     message: { ...message, ...overrides } }, config);
   return { s, field, config, rows, sends, events, memberships, run, row,
-    readCount: () => reads, member: value => { membership = value; } };
+    readCount: () => reads, member: value => { membership = value; },
+    failPhotoAt: value => { failPhotoCalls = new Set(Array.isArray(value) ? value : [value]); },
+    photoCalls: () => photoCalls };
 }
 
 // Missing group routing or allowlist reuse breaks this real photo delivery path.
@@ -119,6 +128,15 @@ alias[10]='unique alias phrase';alias[f.field.CANONICAL_RECORD_ID]='good';alias[
 alias[13]=f.rows[0][13];f.rows.push(alias);
 assert.strictEqual(f.run({text:'/search unique alias'}),'search-results');
 assert.strictEqual(f.sends.length,1);assert.strictEqual(f.sends[0].payload.photo,'photo-good');
+
+// A later ambiguous send never causes earlier results to be replayed for the same update.
+f=fixture();f.rows.push(f.row('good-2'),f.row('good-3'));f.failPhotoAt([2,3]);
+assert.strictEqual(f.run(),'search-partial');
+assert.strictEqual(f.photoCalls(),3);assert.strictEqual(f.sends.filter(x=>x.method==='sendPhoto').length,1);
+assert.deepStrictEqual(f.events.filter(e=>e[4]==='search-delivery').map(e=>e[5]),
+  ['CLAIMED','SENT','CLAIMED','UNKNOWN']);
+assert.strictEqual(f.run(),'duplicate');
+assert.strictEqual(f.photoCalls(),3,'the confirmed first result and ambiguous second result must not be resent');
 
 // Full duplicate worker flow admits one downstream owner and delivers that owner once.
 const {runtime:catalogRuntime}=require('./catalog_fixture');const c=catalogRuntime();

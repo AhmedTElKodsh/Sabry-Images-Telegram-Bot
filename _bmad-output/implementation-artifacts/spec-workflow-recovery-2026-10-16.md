@@ -76,6 +76,18 @@ so incident acceptance stays in-review rather than claiming full live completion
 
 ## Review Triage Log
 
+## Current reconciliation — 2026-10-19
+
+The frozen intent and October 16 live evidence above remain historical. The
+current checkout adds lease-attempt refunds, per-result search dispositions, a
+durable webhook inbox, consolidated operational reporting, manifest-first
+erasure, a PRD-threshold semantic activation gate, and automated verification.
+These changes are locally verified but have not been established as the current
+Apps Script editor source or immutable deployment. Fresh live acceptance,
+second-teacher authorization/revocation, independent-account restoration,
+privacy approval, and real-data semantic evaluation remain pending. See
+`full-workflow-repair-2026-10-19.md` and the generated release manifest.
+
 - medium / patch: bootstrap trimmed the URL while install consumed the raw value.
   Removed the trim and added a whitespace fixture proving failure before mutations.
 - high / patch: provider description redaction could preserve encoded credentials.

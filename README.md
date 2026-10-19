@@ -55,12 +55,14 @@ For the existing verified two-group installation:
 3. Remove temporary wrappers and verify clean source parity, then create a new
    immutable version on the existing deployment. Run
    `installSharedCatalogWorkers()`, `enableGroqTaggingForNewPhotosOnly()` and
-   `enableOutputPublishing()` to restore all five managed workers. The existing
-   valid analysis cutoff is retained. These are five-minute schedules, not
+   `enableOutputPublishing()` to restore all six managed workers, including the
+   durable webhook-inbox worker. The existing valid analysis cutoff is retained. These are five-minute schedules, not
    immediate deadlines.
 4. Run `installWebhook()` to subscribe to `message`, `edited_message` and
    `my_chat_member`, preserving queued Telegram updates.
-5. Inspect `catalogHealth()` and the execution page. `webhookInfo()` returns a
+5. Inspect `catalogOperationalReport()` and the execution page. It combines
+   sanitized stage/inbox health, managed-trigger cardinality, redacted webhook
+   state, and record-scoped recovery candidates. `webhookInfo()` returns a
    redacted URL; never print or inspect the unredacted webhook URL.
 6. Test only the approved synthetic fixture through intake, Drive, Groq,
    publication, search and caption editing. Record local and live evidence
@@ -189,6 +191,11 @@ caption-only fallback → publication → later caption synchronization. Workers
 claim short leases under locks and perform external calls outside those locks.
 They resume the failed stage rather than repeating the whole workflow.
 
+Authenticated webhook updates are first admitted to the `Inbox` sheet. A
+completed Telegram redelivery is acknowledged without processing again; a
+caught processing failure remains bounded retry work for `processPendingInbox()`.
+`FAILED` inbox receipts require operator review and are never bulk-reset.
+
 Temporary failures have five total attempts, with approximately 5, 10, 20 and
 40 minutes between retries. Worker scheduling can make waits longer. Honor a
 longer provider retry-after interval. Unsupported or corrupt images are terminal.
@@ -221,6 +228,19 @@ Choose the affected stage rather than resuming all stages indiscriminately.
 The same wrapper pattern can call `requestCatalogEnrichment('chat_id:message_id')`
 for the specific reviewed record; never bulk-reset catalog rows.
 
+Use `catalogOperationalReport()` for the combined triage view. A trigger count
+other than exactly one is an installation fault. Recovery candidates expose only
+record/update IDs, state, and a bounded action. `PUBLISH_UNKNOWN` is always
+`MANUAL_PUBLICATION_RECONCILIATION_ONLY`; the report never resends it.
+
+Operator alerts are opt-in. Set `OPERATOR_ALERT_CHAT_ID` to the explicit numeric
+Telegram chat ID, install a time trigger for `sendCatalogOperationalAlert()`, and
+test it with synthetic failures. Alerts contain only the sanitized issue summary
+and candidate count. An identical incident fingerprint is suppressed; clear or
+change the underlying state before expecting a new alert. Removing the property
+disables delivery. Alerting is evidence of a reported state, not proof that an
+operator completed recovery.
+
 For a historical record that was never admitted, an operator wrapper may call
 `recoverHistoricalArchive('chat_id:message_id')`. It verifies accessible Drive
 bytes or retrieves the retained Telegram file, compares existing integrity
@@ -251,13 +271,66 @@ in `workflow-debug-and-repair-2026-10-16.md` under implementation artifacts.
 Repeat backups after changes. This does not establish independent-account
 recovery or protect against losing the owning Google account.
 
+## Access and erasure requests
+
+Treat access and deletion as approved, record-scoped operations. Locate the
+exact record and canonical relationship first; do not search by a child's name
+and assume the match is unique. Export or disclose data only through the
+school's approved access-request process and record the controller's decision
+outside this bot.
+
+For deletion, call `planCatalogErasure({...})` first with an approved request
+ID, exact record ID, approver, approval timestamp, and `RECORD` or
+`CANONICAL_GROUP` scope. The plan is read-only and includes target IDs, shared
+object disposition, published-message disposition, and a backup warning. An
+owner-only request fails while retained aliases still depend on that canonical
+record; use reviewed canonical-group scope instead.
+
+Only after the manifest is approved, call `executeCatalogErasure({...})` with
+the identical request fields. It replaces targeted catalog rows with minimal
+tombstones, removes retrieval/publication eligibility, and clears matching
+embedding vectors. It never deletes Drive bytes or Telegram messages: those
+remain separately reviewed manual dispositions, because shared objects and
+ambiguous external outcomes cannot be made safe by a bulk retry. A repeated
+completed request returns `DUPLICATE`. An `erasure-claimed` event without
+`erasure-completed` means execution was interrupted; inspect every target and
+external controller before any new action. Backups and exports have independent
+retention obligations and are not erased by this workflow.
+
 ## Optional semantic pilot
 
-The older Gemini embedding pilot is retained as an isolated operator experiment;
-teacher `/search` does not invoke it. Its explicit dataset, query, expiry and
-non-sensitive-input approval gates remain mandatory. Do not enable it for real
-school imagery. See the retained pilot spec under
+The Gemini embedding pilot remains isolated unless three independent gates all
+match: the live pilot approval, a passing preregistered evaluation result, and
+explicit activation of that result's evaluation ID. Its dataset, query, expiry
+and non-sensitive-input approval gates remain mandatory. Do not enable it for
+real school imagery. See the retained pilot spec under
 `_bmad-output/implementation-artifacts/spec-approved-pilot-semantic-search.md`.
+
+Prepare a JSON evaluation fixture containing the exact approved record IDs and
+queries, indexed record IDs, and per-query language, relevance judgments,
+lexical results, semantic results, and provider-failure disposition. Run:
+
+```powershell
+node tools/evaluate_semantic_retrieval.js path\to\evaluation.json
+```
+
+The command exits nonzero unless all PRD thresholds pass: 50–100 approved and
+indexed records with no silent omissions, 15–20 exact approved queries, at least
+0.90 relevant-in-top-five, at least +0.10 nDCG@10 over lexical, at most 0.20
+false-positive top results, at most 0.10 Arabic/English top-five gap, and at most
+0.05 provider failures. Review the machine-readable output, add a unique
+`evaluation_id`, `integration_approved_by`, `integration_approved_at`, and a
+future `expires_at` no later than the pilot approval, then save the complete JSON
+as `SEMANTIC_EVALUATION_RESULT_JSON`.
+
+Activation is separate. Call
+`enableEvaluatedSemanticTeacherSearch('exact-evaluation-id')` through a reviewed
+operator wrapper. Teacher search uses hybrid ranking only while the result,
+current pilot configuration, current query, expiry, metrics, and activated ID
+all still match; otherwise it falls back to lexical. Run
+`disableEvaluatedSemanticTeacherSearch()` to close the integration gate. A local
+passing fixture is evaluation tooling evidence, not privacy approval or live
+semantic-quality evidence.
 
 ## Local verification
 
@@ -271,6 +344,16 @@ Get-ChildItem tests -Filter '*_check.js' | ForEach-Object {
 Get-Content -Raw -LiteralPath 'apps-script\Code.gs' | node --check -
 git diff --check
 ```
+
+For the CI-equivalent suite and a source/commit evidence manifest, run:
+
+```powershell
+.\tools\verify_release.ps1
+```
+
+The manifest distinguishes local checks from GitHub, editor, immutable-deployment,
+live Telegram, independent-restore, and privacy/semantic gates. It contains no
+credentials or webhook URL.
 
 Offline fixtures prove the cases they exercise. Live synthetic capture/search
 proves that specific deployed path; it does not establish school-corpus relevance
